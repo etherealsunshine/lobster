@@ -21,11 +21,10 @@ from lobster.metrics import get_folded_structure_metrics, calculate_percent_iden
 from lobster.transforms._structure_transforms import StructureBackboneTransform, AminoAcidTokenizerTransform
 from tmtools import tm_align
 from lobster.model import LobsterPLMFold
+from lobster.model.latent_generator.utils import kabsch_torch_batched
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
-# warning emsfolding does not take into account multiple chains
-# todo: add support for multiple chains
 
 
 def add_linker_to_sequence(sequence: str, residue_index_offset: int = 512, chain_linker: str = "G" * 25):
@@ -167,6 +166,7 @@ class MetricsPlotter:
             metrics = [
                 "percent_identity_masked",
                 "percent_identity_unmasked",
+                "rmsd_inpainted",
                 "plddt",
                 "predicted_aligned_error",
                 "tm_score",
@@ -331,6 +331,7 @@ class MetricsCSVWriter:
                 [
                     "percent_identity_masked",
                     "percent_identity_unmasked",
+                    "rmsd_inpainted",
                     "plddt",
                     "predicted_aligned_error",
                     "tm_score",
@@ -408,6 +409,7 @@ class MetricsCSVWriter:
                 [
                     _to_scalar(kwargs.get("percent_identity_masked", "")),
                     _to_scalar(kwargs.get("percent_identity_unmasked", "")),
+                    _to_scalar(kwargs.get("rmsd_inpainted", "")),
                     _to_scalar(metrics.get("_plddt", "")),
                     _to_scalar(metrics.get("_predicted_aligned_error", "")),
                     _to_scalar(metrics.get("_tm_score", "")),
@@ -1581,6 +1583,98 @@ def _generate_forward_folding(
             logger.error(f"Error creating plots: {e}")
 
 
+def _align_and_compute_rmsd_inpainted(
+    gen_coords: torch.Tensor,
+    pred_coords: torch.Tensor,
+    inpainting_mask_seq: torch.Tensor | None,
+    inpainting_mask_struc: torch.Tensor | None,
+    device: torch.device,
+) -> tuple[torch.Tensor, float]:
+    """Align generated structure to ESMFold prediction using Kabsch algorithm on CA atoms,
+    considering only the union of inpainted positions. Then compute RMSD on those positions.
+
+    Args:
+        gen_coords: Generated structure coordinates, shape (N, 3, 3) - [N, CA, C] atoms
+        pred_coords: ESMFold prediction coordinates, shape (N, 3, 3) - [N, CA, C] atoms
+        inpainting_mask_seq: Sequence inpainting mask, shape (N,) or None
+        inpainting_mask_struc: Structure inpainting mask, shape (N,) or None
+        device: torch device
+
+    Returns:
+        gen_coords_aligned: Aligned generated structure, shape (N, 3, 3)
+        rmsd_inpainted: RMSD on inpainted region CA atoms after alignment (float)
+    """
+    N = gen_coords.shape[0]
+
+    # Step 1: Create union mask for all inpainted regions
+    if inpainting_mask_seq is None:
+        inpaint_mask_seq = torch.zeros(N, device=device)
+    else:
+        inpaint_mask_seq = inpainting_mask_seq
+
+    if inpainting_mask_struc is None:
+        inpaint_mask_struc = torch.zeros(N, device=device)
+    else:
+        inpaint_mask_struc = inpainting_mask_struc
+
+    # Union: any position that was inpainted in sequence OR structure
+    inpaint_mask_union = (inpaint_mask_seq.bool() | inpaint_mask_struc.bool()).float()
+
+    # Step 2: Check if there are any inpainted positions
+    num_inpainted = inpaint_mask_union.sum().item()
+    if num_inpainted == 0:
+        logger.warning("No inpainted positions found, skipping alignment")
+        return gen_coords, 0.0
+
+    # Step 3: Extract CA atoms (index 1)
+    gen_coords_ca = gen_coords[:, 1, :]  # Shape: (N, 3)
+    pred_coords_ca = pred_coords[:, 1, :]  # Shape: (N, 3)
+
+    # Step 4: Add batch dimension for kabsch_torch_batched
+    gen_coords_ca_batch = gen_coords_ca.unsqueeze(0)  # Shape: (1, N, 3)
+    pred_coords_ca_batch = pred_coords_ca.unsqueeze(0)  # Shape: (1, N, 3)
+    inpaint_mask_batch = inpaint_mask_union.unsqueeze(0)  # Shape: (1, N)
+
+    # Step 5: Apply Kabsch alignment - get rotation R and translation t
+    gen_coords_ca_aligned_batch, (R, t) = kabsch_torch_batched(
+        P=gen_coords_ca_batch,  # Source: generated structure CA atoms
+        Q=pred_coords_ca_batch,  # Target: ESMFold prediction CA atoms
+        mask=inpaint_mask_batch,  # Only use inpainted positions for alignment
+        return_transform=True,  # Need R and t to transform all atoms
+    )
+
+    gen_coords_ca_aligned = gen_coords_ca_aligned_batch.squeeze(0)  # Shape: (N, 3)
+
+    # Step 6: Calculate RMSD on inpainted region CA atoms after alignment
+    gen_inpainted_ca = gen_coords_ca_aligned[inpaint_mask_union.bool()]  # (M, 3)
+    pred_inpainted_ca = pred_coords_ca[inpaint_mask_union.bool()]  # (M, 3)
+
+    rmsd_inpainted = torch.sqrt(torch.mean((gen_inpainted_ca - pred_inpainted_ca) ** 2)).item()
+
+    # Step 7: Apply the same transformation (R, t) to ALL atoms (N, CA, C)
+    # This maintains the structural integrity of the backbone
+    R = R.squeeze(0)  # Shape: (3, 3)
+    t = t.squeeze(0)  # Shape: (3,)
+
+    # Get centroid of generated CA atoms (computed internally by Kabsch)
+    centroid_gen_ca = torch.sum(gen_coords_ca * inpaint_mask_union.unsqueeze(-1), dim=0) / inpaint_mask_union.sum()
+    centroid_pred_ca = torch.sum(pred_coords_ca * inpaint_mask_union.unsqueeze(-1), dim=0) / inpaint_mask_union.sum()
+
+    # Center all atoms around the CA centroid
+    gen_coords_centered = gen_coords - centroid_gen_ca.unsqueeze(0).unsqueeze(0)  # (N, 3, 3)
+
+    # Apply rotation to all atoms
+    gen_coords_rotated = torch.matmul(
+        gen_coords_centered.reshape(N * 3, 3),
+        R.transpose(0, 1),  # Flatten to (N*3, 3)  # Rotate
+    ).reshape(N, 3, 3)  # Reshape back to (N, 3, 3)
+
+    # Translate to target centroid
+    gen_coords_aligned = gen_coords_rotated + centroid_pred_ca.unsqueeze(0).unsqueeze(0)
+
+    return gen_coords_aligned, rmsd_inpainted
+
+
 def _generate_inpainting(
     model, cfg: DictConfig, device: torch.device, output_dir: Path, plm_fold=None, csv_writer=None, plotter=None
 ) -> None:
@@ -1652,6 +1746,7 @@ def _generate_inpainting(
     all_predicted_aligned_errors = []
     all_tm_scores = []
     all_rmsd_scores = []
+    all_rmsd_inpainted = []
 
     with torch.no_grad():
         # Process structure files in batches
@@ -1834,6 +1929,7 @@ def _generate_inpainting(
 
                 # Calculate TM-scores for this trial
                 trial_tm_scores = []
+                trial_rmsd_inpainted = []
                 for i in range(B):
                     # Get original and generated coordinates
                     orig_coords = coords_res[i, mask[i] == 1, :, :]  # Original structure
@@ -1887,9 +1983,31 @@ def _generate_inpainting(
                             outputs, orig_coords[None], [sequence_str], mask=mask[i : i + 1]
                         )
 
+                        # Align generated structure to ESMFold prediction and compute RMSD on inpainted region
+                        inpaint_mask_seq_i = (
+                            inpainting_mask_seq[i, mask[i] == 1] if inpainting_mask_seq is not None else None
+                        )
+                        inpaint_mask_struc_i = (
+                            inpainting_mask_struc[i, mask[i] == 1] if inpainting_mask_struc is not None else None
+                        )
+
+                        gen_coords_aligned, rmsd_inpainted = _align_and_compute_rmsd_inpainted(
+                            gen_coords=gen_coords,
+                            pred_coords=pred_coords[i],
+                            inpainting_mask_seq=inpaint_mask_seq_i,
+                            inpainting_mask_struc=inpaint_mask_struc_i,
+                            device=device,
+                        )
+
+                        # Update x_recon_xyz with aligned coordinates
+                        x_recon_xyz[i, mask[i] == 1] = gen_coords_aligned
+
                         trial_tm_scores.append(folded_structure_metrics["_tm_score"])
+                        trial_rmsd_inpainted.append(rmsd_inpainted)
                         trial_folded_structure_metrics = folded_structure_metrics  # Store for reuse
-                        logger.info(f"TM-score: {folded_structure_metrics['_tm_score']:.3f}")
+                        logger.info(
+                            f"TM-score: {folded_structure_metrics['_tm_score']:.3f}, Inpainted RMSD: {rmsd_inpainted:.3f} Å"
+                        )
 
                     else:
                         # Calculate TM-Score using TM-align
@@ -1900,6 +2018,7 @@ def _generate_inpainting(
                             sequence_str,
                         )
                         trial_tm_scores.append(tm_out.tm_norm_chain1)
+                        trial_rmsd_inpainted.append(0.0)  # No ESMFold, no inpainted RMSD
                         logger.info(f"Sample {i}: TM-Score: {tm_out.tm_norm_chain1:.3f}, RMSD: {tm_out.rmsd:.2f} Å")
 
                 # Store trial results
@@ -1907,7 +2026,11 @@ def _generate_inpainting(
                     {
                         "trial": trial,
                         "tm_scores": trial_tm_scores,
+                        "rmsd_inpainted": trial_rmsd_inpainted,
                         "avg_tm_score": sum(trial_tm_scores) / len(trial_tm_scores),
+                        "avg_rmsd_inpainted": sum(trial_rmsd_inpainted) / len(trial_rmsd_inpainted)
+                        if trial_rmsd_inpainted
+                        else 0.0,
                         "generate_sample": generate_sample,
                         "x_recon_xyz": x_recon_xyz,
                         "seq": seq,
@@ -2034,6 +2157,10 @@ def _generate_inpainting(
                     all_percent_identities_masked.extend(batch_percent_identities_masked)
                     all_percent_identities_unmasked.extend(batch_percent_identities_unmasked)
 
+                    # Collect RMSD from inpainted region (from best trial)
+                    if "rmsd_inpainted" in best_trial and best_trial["rmsd_inpainted"]:
+                        all_rmsd_inpainted.extend(best_trial["rmsd_inpainted"])
+
                     # Write batch metrics to CSV
                     if csv_writer is not None:
                         run_id = f"inpainting_batch_{batch_idx:03d}"
@@ -2049,11 +2176,17 @@ def _generate_inpainting(
                             inpainting_mask_struc[0].sum().item() if inpainting_mask_struc is not None else 0
                         )
 
+                        # Calculate average RMSD for inpainted region
+                        avg_rmsd_inpainted = (
+                            best_trial["avg_rmsd_inpainted"] if "avg_rmsd_inpainted" in best_trial else 0.0
+                        )
+
                         csv_writer.write_batch_metrics(
                             batch_metrics,
                             run_id,
                             percent_identity_masked=avg_percent_identity_masked,
                             percent_identity_unmasked=avg_percent_identity_unmasked,
+                            rmsd_inpainted=avg_rmsd_inpainted,
                             sequence_length=max_length,
                             num_masked_seq=num_masked_seq,
                             num_masked_struc=num_masked_struc,
@@ -2107,6 +2240,12 @@ def _generate_inpainting(
     else:
         logger.warning("No RMSD data collected")
 
+    if all_rmsd_inpainted:
+        avg_rmsd_inpainted = sum(all_rmsd_inpainted) / len(all_rmsd_inpainted)
+        logger.info(f"Average RMSD (Inpainted Region): {avg_rmsd_inpainted:.3f} Å (n={len(all_rmsd_inpainted)})")
+    else:
+        logger.warning("No inpainted region RMSD data collected")
+
     logger.info("=" * 80)
 
     # Write aggregate statistics to CSV
@@ -2117,6 +2256,7 @@ def _generate_inpainting(
         metric_lists = {
             "percent_identity_masked": all_percent_identities_masked,
             "percent_identity_unmasked": all_percent_identities_unmasked,
+            "rmsd_inpainted": all_rmsd_inpainted,
             "plddt": all_plddt_scores,
             "predicted_aligned_error": all_predicted_aligned_errors,
             "tm_score": all_tm_scores,

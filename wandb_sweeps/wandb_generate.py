@@ -6,7 +6,10 @@ This script integrates with wandb sweeps to optimize generation parameters.
 Based on the wandb sweeps walkthrough: https://docs.wandb.ai/guides/sweeps/walkthrough/
 
 Usage:
-    python wandb_generate.py --config_path=src/lobster/hydra_config/experiment --config_name=generate_unconditional
+    wandb sweep <path to yaml>
+    Update the id in the wandb_slurm.sh script to the wandb run id:
+    srun -u --cpus-per-task $SLURM_CPUS_PER_TASK --cpu-bind=cores,verbose wandb agent prescient-design/lobster-wandb_sweeps/<wandb run id>
+    sbatch wandb_slurm.sh
 """
 
 from pathlib import Path
@@ -96,6 +99,19 @@ def create_config_from_wandb(config) -> DictConfig:
             raise ValueError("input_structures must be provided for forward folding mode")
         logger.info(f"Using input structures: {config_dict['generation']['input_structures']}")
 
+    elif mode == "inpainting":
+        # Inpainting specific settings
+        if config_dict["generation"]["input_structures"] is None:
+            raise ValueError("input_structures must be provided for inpainting mode")
+
+        # Add inpainting-specific parameters
+        config_dict["generation"]["mask_indices_sequence"] = config.get("mask_indices_sequence", "")
+        config_dict["generation"]["mask_indices_structure"] = config.get("mask_indices_structure", "")
+
+        logger.info(f"Using input structures: {config_dict['generation']['input_structures']}")
+        logger.info(f"Sequence mask indices: {config_dict['generation']['mask_indices_sequence']}")
+        logger.info(f"Structure mask indices: {config_dict['generation']['mask_indices_structure']}")
+
     elif mode == "unconditional":
         # Unconditional generation - no input structures needed
         config_dict["generation"]["input_structures"] = None
@@ -129,6 +145,16 @@ def collect_metrics_from_output(output_dir: str) -> dict[str, float]:
         metric_columns = ["percent_identity", "plddt", "predicted_aligned_error", "tm_score", "rmsd"]
     elif mode == "forward_folding":
         metric_columns = ["tm_score", "rmsd"]
+    elif mode == "inpainting":
+        metric_columns = [
+            "percent_identity_masked",
+            "percent_identity_unmasked",
+            "rmsd_inpainted",
+            "plddt",
+            "predicted_aligned_error",
+            "tm_score",
+            "rmsd",
+        ]
     else:
         metric_columns = ["plddt", "predicted_aligned_error", "tm_score", "rmsd"]
 
@@ -163,12 +189,15 @@ def calculate_composite_score(metrics: dict[str, float]) -> float:
     - Unconditional: Focus on plddt, tm_score, minimize PAE and RMSD
     - Inverse folding: Focus on percent_identity, plddt, tm_score
     - Forward folding: Focus on tm_score, minimize RMSD
+    - Inpainting: Focus on percent_identity_masked, rmsd_inpainted (post-alignment), tm_score, plddt
     """
     score = 0.0
 
     # Determine mode from available metrics
     mode = "unconditional"  # default
-    if "avg_percent_identity" in metrics:
+    if "avg_percent_identity_masked" in metrics or "avg_rmsd_inpainted" in metrics:
+        mode = "inpainting"
+    elif "avg_percent_identity" in metrics:
         mode = "inverse_folding"
     elif "avg_tm_score" in metrics and "avg_plddt" not in metrics:
         mode = "forward_folding"
@@ -214,6 +243,30 @@ def calculate_composite_score(metrics: dict[str, float]) -> float:
         # Lower is better: rmsd
         if "avg_rmsd" in metrics:
             score -= metrics["avg_rmsd"] / 10 * 0.3
+
+    elif mode == "inpainting":
+        # Higher is better: percent_identity_masked, percent_identity_unmasked, plddt, tm_score
+        if "avg_percent_identity_masked" in metrics:
+            score += metrics["avg_percent_identity_masked"] * 0.25  # How well we recovered masked sequence
+
+        if "avg_percent_identity_unmasked" in metrics:
+            score += metrics["avg_percent_identity_unmasked"] * 0.15  # Preserved unmasked regions
+
+        if "avg_plddt" in metrics:
+            score += metrics["avg_plddt"] * 0.0015  # Structure quality (scale to 0-100 range)
+
+        if "avg_tm_score" in metrics:
+            score += metrics["avg_tm_score"] * 0.20  # Overall structural similarity
+
+        # Lower is better: rmsd_inpainted, predicted_aligned_error, rmsd
+        if "avg_rmsd_inpainted" in metrics:
+            score -= metrics["avg_rmsd_inpainted"] / 5 * 0.20  # KEY: minimize structural deviation in inpainted region
+
+        if "avg_predicted_aligned_error" in metrics:
+            score -= metrics["avg_predicted_aligned_error"] / 100 * 0.05  # Minimize PAE
+
+        if "avg_rmsd" in metrics:
+            score -= metrics["avg_rmsd"] / 10 * 0.05  # Minimize overall RMSD
 
     logger.info(f"Calculated composite score for {mode} mode: {score:.4f}")
     return score
