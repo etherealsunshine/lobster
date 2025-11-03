@@ -1572,6 +1572,9 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
+anarci = [
+    { name = "prescient-anarci", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-6-lbster-lg-cpu' and extra == 'extra-6-lbster-lg-gpu')" },
+]
 flash = [
     { name = "flash-attn", marker = "sys_platform == 'linux' or (extra == 'extra-6-lbster-lg-cpu' and extra == 'extra-6-lbster-lg-gpu')" },
     { name = "rotary-embedding-torch", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-6-lbster-lg-cpu' and extra == 'extra-6-lbster-lg-gpu')" },
@@ -1708,6 +1711,7 @@ requires-dist = [
     { name = "polars", marker = "extra == 'lg-cpu'" },
     { name = "polars", marker = "extra == 'lg-gpu'" },
     { name = "pooch" },
+    { name = "prescient-anarci", marker = "extra == 'anarci'" },
     { name = "pyarrow" },
     { name = "pydantic", marker = "extra == 'mcp'", specifier = ">=2.0.0" },
     { name = "python-dotenv" },
@@ -1744,7 +1748,7 @@ requires-dist = [
     { name = "universal-pathlib" },
     { name = "wandb" },
 ]
-provides-extras = ["lg-cpu", "lg-gpu", "mgm", "flash", "mcp", "trl"]
+provides-extras = ["lg-cpu", "lg-gpu", "anarci", "mgm", "flash", "mcp", "trl"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -2964,6 +2968,19 @@ wheels = [
 ]
 
 [[package]]
+name = "prescient-anarci"
+version = "0.0.2.dev30+g7365661"
+source = { registry = "https://code.roche.com/api/v4/projects/28907/packages/pypi/simple" }
+dependencies = [
+    { name = "biopython", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-6-lbster-lg-cpu' and extra == 'extra-6-lbster-lg-gpu')" },
+    { name = "pyhmmer", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-6-lbster-lg-cpu' and extra == 'extra-6-lbster-lg-gpu')" },
+]
+sdist = { url = "https://code.roche.com/api/v4/projects/28907/packages/pypi/files/ed938f0c0542d5b81e4a7f9295e399aec17583ceb59cf33bfdcaca0896e82017/prescient_anarci-0.0.2.dev30+g7365661.tar.gz", hash = "sha256:ed938f0c0542d5b81e4a7f9295e399aec17583ceb59cf33bfdcaca0896e82017" }
+wheels = [
+    { url = "https://code.roche.com/api/v4/projects/28907/packages/pypi/files/988fc141625f73e8329496d634a70260e12775d8f6e18d8cd4e0205600a817a0/prescient_anarci-0.0.2.dev30+g7365661-py3-none-any.whl", hash = "sha256:988fc141625f73e8329496d634a70260e12775d8f6e18d8cd4e0205600a817a0" },
+]
+
+[[package]]
 name = "prompt-toolkit"
 version = "3.0.52"
 source = { registry = "https://pypi.python.org/simple" }
@@ -3183,6 +3200,25 @@ source = { registry = "https://pypi.python.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/b0/77/a5b8c569bf593b0140bde72ea885a803b82086995367bf2037de0159d924/pygments-2.19.2.tar.gz", hash = "sha256:636cb2477cec7f8952536970bc533bc43743542f70392ae026374600add5b887", size = 4968631, upload-time = "2025-06-21T13:39:12.283Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/c7/21/705964c7812476f378728bdf590ca4b771ec72385c533964653c68e86bdc/pygments-2.19.2-py3-none-any.whl", hash = "sha256:86540386c03d588bb81d44bc3928634ff26449851e99741617ecb9037ee5ec0b", size = 1225217, upload-time = "2025-06-21T13:39:07.939Z" },
+]
+
+[[package]]
+name = "pyhmmer"
+version = "0.11.1"
+source = { registry = "https://pypi.python.org/simple" }
+dependencies = [
+    { name = "psutil", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or (extra == 'extra-6-lbster-lg-cpu' and extra == 'extra-6-lbster-lg-gpu')" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/71/c6/19e7c009e9c58c1d0d30a47ca0ac0c60ccb9effb62848afa55d53d3a17e3/pyhmmer-0.11.1.tar.gz", hash = "sha256:f83e9a7d80f31713c52291b5c888dddb98c1e765222e064c40d56e87ad91cc4e", size = 7289346, upload-time = "2025-05-08T16:42:31.347Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/00/dd/62cc7a4d76f0f86d3ab295268e6d6de8947fc96d627b2540f948d9adf37d/pyhmmer-0.11.1-cp311-cp311-macosx_10_9_x86_64.whl", hash = "sha256:ce3d8478890da38519d2c58e6711926f56b0ebbafec9e652a9b45634a41773f4", size = 4879880, upload-time = "2025-05-08T16:41:35.092Z" },
+    { url = "https://files.pythonhosted.org/packages/31/7c/c009b97d68440def90be993b3d891d54432c6fe1fe883f19f3fe51e07f9f/pyhmmer-0.11.1-cp311-cp311-macosx_11_0_arm64.whl", hash = "sha256:3d2bcfe9bfe9cd70178793de2ff376d3fb30d61dd07753e22a99b7600f09f36d", size = 4692425, upload-time = "2025-05-08T16:41:37.483Z" },
+    { url = "https://files.pythonhosted.org/packages/ad/fc/fb253ec8b960cecb39e666da8910da3e83a51af4c877da0aabe22e223898/pyhmmer-0.11.1-cp311-cp311-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:36fb8b2097374be68b6cbf0e699e05b9f6779edb65e548e11b4b54b43b2c222a", size = 5092510, upload-time = "2025-05-08T16:41:39.665Z" },
+    { url = "https://files.pythonhosted.org/packages/02/e0/eb3fb3ceab566fbcde2504a0708e5bb86da7aef334ffddf82594be29001a/pyhmmer-0.11.1-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:9a6e4464899806f4418eeae1aa97ddfeaa2480518b14f288955ec0bd11e051af", size = 5188604, upload-time = "2025-05-08T16:41:43.629Z" },
+    { url = "https://files.pythonhosted.org/packages/a9/44/c21cc928e46f3d554c32fecfff11eb02e6e371415da667057b9a155a875b/pyhmmer-0.11.1-cp312-cp312-macosx_10_13_x86_64.whl", hash = "sha256:f5200a27c6e6fafa70d536798c4332b91c8839576c86067986a4af2704b6c402", size = 4879841, upload-time = "2025-05-08T16:41:45.475Z" },
+    { url = "https://files.pythonhosted.org/packages/0e/cb/ea26d6052b2f2f68b4af6950fb69a97d00c37f6a0aece2cc7622b2998d2e/pyhmmer-0.11.1-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:202e9f085a8b5e780f19cc2994c1badc92a296e4cf7e1fedfe42c40b8648360d", size = 4688218, upload-time = "2025-05-08T16:41:48.047Z" },
+    { url = "https://files.pythonhosted.org/packages/6a/86/d8188c3c7877464adb18f825af34afb5f93b01cd107aa96417d40cbc4437/pyhmmer-0.11.1-cp312-cp312-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:3d207c24ad7555db6fb831ec45ec12f17e306e88aaddef3cd42f9b09c8f9e727", size = 4999844, upload-time = "2025-05-08T16:41:49.905Z" },
+    { url = "https://files.pythonhosted.org/packages/15/91/974ac21d41af3b8e9d089570958de1436ffba1ad5495f77fa69f0d227e91/pyhmmer-0.11.1-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:577bd88d1a3f3ddcfee8b57982fb2fcece44f55740b069addbaf3baca87ea45e", size = 5108649, upload-time = "2025-05-08T16:41:52.484Z" },
 ]
 
 [[package]]

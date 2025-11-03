@@ -29,6 +29,7 @@ from ._utils import (
     sample_list_with_probs,
     uniform_sample,
 )
+from .anarci_numbering import anarci_numbering
 
 __all__ = [
     "get_biopython_features",

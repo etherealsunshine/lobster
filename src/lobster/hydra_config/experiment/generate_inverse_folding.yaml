@@ -17,14 +17,15 @@ generation:
   mode: inverse_folding
   nsteps: 200          # Fewer steps for inverse folding
   batch_size: 1        # Process 1 structures at a time
-  n_trials: 1          # Number of trials for best output selection
+  n_trials: 3          # Number of trials for best output selection
   
   #Generation parameters
   temperature_seq: 0.16423763902324678    
   temperature_struc: 1.0  
   stochasticity_seq: 20 
   stochasticity_struc: 10
-  
+
+  n_designs_per_structure: 10  # Number of designs to generate per structure
   # Input structures - update these paths to your PDB files
   # Examples of different input formats:
   # Single file: input_structures: "/path/to/structure.pdb"

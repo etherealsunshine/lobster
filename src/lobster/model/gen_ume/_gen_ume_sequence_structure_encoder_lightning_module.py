@@ -435,6 +435,7 @@ class UMESequenceStructureEncoderLightningModule(LightningModule):
         input_indices: Tensor = None,
         inpainting_mask_sequence: Tensor = None,
         inpainting_mask_structure: Tensor = None,
+        asynchronous_sampling: bool = False,
     ):
         """Generate with model, with option to return full unmasking trajectory and likelihood."""
         device = next(self.parameters()).device
@@ -514,9 +515,9 @@ class UMESequenceStructureEncoderLightningModule(LightningModule):
             t_seq = inference_schedule_seq.pad_time(num_samples, t_seq, device)
             t_struc = inference_schedule_struc.pad_time(num_samples, t_struc, device)
             timesteps = {"sequence_tokens": t_seq, "structure_tokens": t_struc}
+
             unmasked_x = self.forward(xt, mask, residue_index, conditioning_tensor, timesteps=timesteps)
             unmasked_sequence_tokens = unmasked_x["sequence_logits"]
-            unmasked_structure_tokens = unmasked_x["structure_logits"]
             xt_seq_new = self.interpolant_seq.step(
                 unmasked_sequence_tokens,
                 t_seq,
@@ -525,6 +526,10 @@ class UMESequenceStructureEncoderLightningModule(LightningModule):
                 stochasticity=stochasticity_seq,
                 temperature=temperature_seq,
             )
+            # if asynchronous_sampling: # onestep structure prediction
+            #    unmasked_x = self.forward({"sequence_tokens": unmasked_sequence_tokens.argmax(dim=-1), "structure_tokens": self.interpolant_struc.sample_prior((num_samples, length))}, mask, residue_index, conditioning_tensor, timesteps={"sequence_tokens": torch.full_like(t_seq, 0.9950), "structure_tokens": torch.full_like(t_seq, 0.0000)})
+
+            unmasked_structure_tokens = unmasked_x["structure_logits"]
             xt_struc_new = self.interpolant_struc.step(
                 unmasked_structure_tokens,
                 t_struc,

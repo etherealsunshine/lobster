@@ -34,34 +34,77 @@ def objective(config):
     Returns:
         float: Composite score for optimization
     """
-    # Create config from wandb parameters
-    gen_config = create_config_from_wandb(config)
+    # Get generation lengths (list of lengths to test)
+    lengths = config.get("generation_lengths", [200])
+    if not isinstance(lengths, list):
+        lengths = [lengths]
 
-    # Run generation
-    run_generation(gen_config)
+    logger.info(f"Running generation for {len(lengths)} lengths: {lengths}")
 
-    # Collect metrics
-    metrics = collect_metrics_from_output(gen_config.output_dir)
+    # Run generation for each length
+    output_dirs = []
+    for length in lengths:
+        logger.info(f"Starting generation for length {length}")
 
-    # Calculate composite score
-    composite_score = calculate_composite_score(metrics)
+        # Create config from wandb parameters for this length
+        gen_config = create_config_from_wandb(config, length=length)
 
-    # Log metrics to wandb
-    wandb.log({**metrics, "composite_score": composite_score})
+        # Run generation
+        run_generation(gen_config)
+
+        output_dirs.append(gen_config.output_dir)
+        logger.info(f"Completed generation for length {length}, output: {gen_config.output_dir}")
+
+    # Collect metrics from all length runs
+    metrics = collect_metrics_from_all_lengths(output_dirs, lengths)
+
+    # Extract score weights from config
+    score_weights = {
+        "diversity": config.get("score_weight_diversity", 1.0),
+        "plddt": config.get("score_weight_plddt", 0.05),
+        "tm_score": config.get("score_weight_tm_score", 0.05),
+        "pae": config.get("score_weight_pae", 0.05),
+        "rmsd": config.get("score_weight_rmsd", 0.05),
+    }
+
+    # Calculate composite score (now aggregated across lengths)
+    composite_score = calculate_composite_score(metrics, score_weights)
+
+    # Log metrics to wandb (includes per-length and aggregated)
+    log_data = {**metrics, "composite_score": composite_score, **{f"weight_{k}": v for k, v in score_weights.items()}}
+
+    # Add length-specific diversity metrics for visualization
+    for length in lengths:
+        cluster_key = f"length_{length}_diversity_num_clusters_length_{length}"
+        if cluster_key in metrics:
+            log_data[f"diversity_by_length/{length}"] = metrics[cluster_key]
+
+    wandb.log(log_data)
 
     logger.info(f"Run completed with composite score: {composite_score:.4f}")
     return composite_score
 
 
-def create_config_from_wandb(config) -> DictConfig:
-    """Create genUME config from wandb sweep parameters."""
+def create_config_from_wandb(config, length: int | None = None) -> DictConfig:
+    """
+    Create genUME config from wandb sweep parameters.
+
+    Args:
+        config: wandb config object
+        length: Optional length override for multi-length generation
+    """
 
     # Get generation mode from config
     mode = config.get("mode", "unconditional")
 
+    # Determine length to use
+    if length is None:
+        # Single length mode (backward compatible)
+        length = config.get("length", 200)
+
     # Base config structure
     config_dict = {
-        "output_dir": f"./wandb_outputs/{wandb.run.id}",
+        "output_dir": f"./wandb_outputs/{wandb.run.id}/length_{length}",
         "seed": 12345,
         "model": {
             "_target_": "lobster.model.gen_ume.UMESequenceStructureEncoderLightningModule",
@@ -69,7 +112,7 @@ def create_config_from_wandb(config) -> DictConfig:
         },
         "generation": {
             "mode": mode,
-            "length": config.get("length", 200),
+            "length": length,
             "num_samples": config.get("num_samples", 10),
             "nsteps": config.get("nsteps", 200),
             "temperature_seq": config.get("temperature_seq", 0.5),
@@ -83,6 +126,13 @@ def create_config_from_wandb(config) -> DictConfig:
             "batch_size": config.get("batch_size", 1),
             "n_trials": config.get("n_trials", 1),
             "input_structures": config.get("input_structures", None),
+            # Foldseek Diversity Analysis
+            "calculate_foldseek_diversity": config.get("calculate_foldseek_diversity", True),
+            "foldseek_bin_path": config.get(
+                "foldseek_bin_path", "/homefs/home/lisanzas/scratch/Develop/lobster/src/lobster/metrics/foldseek/bin"
+            ),
+            "foldseek_tmscore_threshold": config.get("foldseek_tmscore_threshold", 0.5),
+            "rmsd_threshold_for_diversity": config.get("rmsd_threshold_for_diversity", 2.0),
         },
     }
 
@@ -115,6 +165,39 @@ def create_config_from_wandb(config) -> DictConfig:
     elif mode == "unconditional":
         # Unconditional generation - no input structures needed
         config_dict["generation"]["input_structures"] = None
+
+        # Add self-reflection parameters if enabled
+        if config.get("enable_self_reflection", False):
+            logger.info("Enabling self-reflection refinement for unconditional generation")
+            config_dict["generation"]["enable_self_reflection"] = True
+            config_dict["generation"]["self_reflection"] = {
+                "use_esmfold_validation": False,  # Optional ESMFold validation within self-reflection
+                "forward_folding": {
+                    "nsteps": config.get("self_reflection_forward_nsteps", 100),
+                    "temperature_seq": config.get("self_reflection_forward_temp_seq", 0.2967457760634187),
+                    "temperature_struc": config.get("self_reflection_forward_temp_struc", 0.1102551183666233),
+                    "stochasticity_seq": config.get("self_reflection_forward_stoch_seq", 10),
+                    "stochasticity_struc": config.get("self_reflection_forward_stoch_struc", 30),
+                },
+                "inverse_folding": {
+                    "nsteps": config.get("self_reflection_inverse_nsteps", 200),
+                    "temperature_seq": config.get("self_reflection_inverse_temp_seq", 0.16423763902324678),
+                    "temperature_struc": config.get("self_reflection_inverse_temp_struc", 1.0),
+                    "stochasticity_seq": config.get("self_reflection_inverse_stoch_seq", 20),
+                    "stochasticity_struc": config.get("self_reflection_inverse_stoch_struc", 10),
+                },
+                "quality_control": {
+                    "enable_tm_threshold": True,
+                    "min_tm_score_forward": config.get("self_reflection_min_tm_score", 0.8),
+                    "enable_min_percent_identity_threshold": True,
+                    "min_percent_identity": config.get("self_reflection_min_percent_identity", 20.0),
+                    "enable_max_percent_identity_threshold": True,
+                    "max_percent_identity": config.get("self_reflection_max_percent_identity", 90.0),
+                    "enable_sequence_token_check": True,
+                    "max_retries": config.get("self_reflection_max_retries", 30),
+                },
+            }
+            logger.info(f"Self-reflection config: {config_dict['generation']['self_reflection']}")
 
     return OmegaConf.create(config_dict)
 
@@ -178,20 +261,184 @@ def collect_metrics_from_output(output_dir: str) -> dict[str, float]:
 
     logger.info(f"Collected metrics for {mode} mode: {metrics}")
 
+    # Collect Foldseek diversity metrics (unconditional mode only)
+    if mode == "unconditional":
+        try:
+            from biotite.sequence.io import fasta
+
+            # Look for diversity results files
+            diversity_files = list(output_path.glob("foldseek_results/length_*/res_rep_seq.fasta"))
+
+            if diversity_files:
+                logger.info(f"Found {len(diversity_files)} Foldseek diversity result files")
+
+                for div_file in diversity_files:
+                    # Count clusters from Foldseek output
+                    fasta_content = fasta.FastaFile.read(str(div_file))
+                    num_clusters = len(fasta_content)
+
+                    # Extract length from path: foldseek_results/length_500/res_rep_seq.fasta
+                    length = int(div_file.parent.name.split("_")[1])
+
+                    # Get total structures passing RMSD threshold from CSV
+                    if "rmsd" in df.columns:
+                        rmsd_values = pd.to_numeric(df["rmsd"], errors="coerce").dropna()
+                        total_passing = len(rmsd_values[rmsd_values < 2.0])
+                    else:
+                        total_passing = 0
+
+                    # Store diversity metrics
+                    metrics[f"diversity_num_clusters_length_{length}"] = num_clusters
+                    metrics[f"diversity_total_structures_length_{length}"] = total_passing
+
+                    if total_passing > 0:
+                        diversity_pct = (num_clusters / total_passing) * 100
+                        metrics[f"diversity_percentage_length_{length}"] = diversity_pct
+                        diversity_str = f"{diversity_pct:.1f}%"
+                    else:
+                        diversity_str = "N/A"
+
+                    logger.info(
+                        f"Diversity metrics for length {length}: "
+                        f"{num_clusters}/{total_passing} clusters ({diversity_str})"
+                    )
+            else:
+                logger.debug("No Foldseek diversity results found")
+
+        except Exception as e:
+            logger.warning(f"Failed to collect diversity metrics: {e}")
+
     return metrics
 
 
-def calculate_composite_score(metrics: dict[str, float]) -> float:
+def collect_metrics_from_all_lengths(output_dirs: list[str], lengths: list[int]) -> dict[str, float]:
+    """
+    Collect metrics from multiple length-specific output directories.
+
+    Args:
+        output_dirs: List of output directory paths, one per length
+        lengths: List of generation lengths corresponding to output_dirs
+
+    Returns:
+        Dictionary with both per-length metrics and aggregated metrics
+    """
+    all_metrics = {}
+    per_length_metrics = {}
+
+    logger.info(f"Collecting metrics from {len(output_dirs)} length runs")
+
+    # Collect metrics for each length
+    for output_dir, length in zip(output_dirs, lengths):
+        logger.info(f"Collecting metrics for length {length} from {output_dir}")
+        length_metrics = collect_metrics_from_output(output_dir)
+        per_length_metrics[length] = length_metrics
+
+        # Store per-length metrics with prefix
+        for metric_name, value in length_metrics.items():
+            all_metrics[f"length_{length}_{metric_name}"] = value
+
+    # Calculate aggregated metrics across all lengths
+    logger.info("Aggregating metrics across all lengths")
+    aggregate_metrics = aggregate_across_lengths(per_length_metrics)
+    all_metrics.update(aggregate_metrics)
+
+    logger.info(f"Total metrics collected: {len(all_metrics)} (per-length + aggregated)")
+    return all_metrics
+
+
+def aggregate_across_lengths(per_length_metrics: dict[int, dict[str, float]]) -> dict[str, float]:
+    """
+    Aggregate metrics across all lengths using simple averaging.
+
+    Args:
+        per_length_metrics: Dict mapping length → metrics dict
+
+    Returns:
+        Dictionary of aggregated metrics with 'agg_' prefix
+    """
+    aggregated = {}
+
+    if not per_length_metrics:
+        logger.warning("No per-length metrics to aggregate")
+        return aggregated
+
+    # Collect all unique metric keys
+    all_metric_keys = set()
+    for metrics in per_length_metrics.values():
+        all_metric_keys.update(metrics.keys())
+
+    logger.debug(f"Aggregating {len(all_metric_keys)} unique metric types across {len(per_length_metrics)} lengths")
+
+    # For each metric, calculate mean across lengths
+    for metric_key in all_metric_keys:
+        values = []
+        for length, metrics in per_length_metrics.items():
+            if metric_key in metrics:
+                values.append(metrics[metric_key])
+
+        if values:
+            aggregated[f"agg_{metric_key}"] = sum(values) / len(values)
+
+    # Special handling for diversity: sum total clusters across ALL lengths
+    cluster_keys = [k for k in all_metric_keys if k.startswith("diversity_num_clusters_")]
+    if cluster_keys:
+        total_clusters = 0
+        for length, metrics in per_length_metrics.items():
+            for k in cluster_keys:
+                if k in metrics:
+                    total_clusters += metrics[k]
+
+        aggregated["agg_total_clusters_all_lengths"] = total_clusters
+        logger.info(f"Total clusters across all lengths: {total_clusters}")
+
+    # Also calculate total structures across all lengths
+    total_structures = 0
+    for length, metrics in per_length_metrics.items():
+        for k in all_metric_keys:
+            if k.startswith("diversity_total_structures_"):
+                total_structures += metrics.get(k, 0)
+
+    if total_structures > 0:
+        aggregated["agg_total_structures_all_lengths"] = total_structures
+        if total_clusters > 0:
+            aggregated["agg_diversity_percentage_all_lengths"] = (total_clusters / total_structures) * 100
+            logger.info(
+                f"Overall diversity: {total_clusters}/{total_structures} = {aggregated['agg_diversity_percentage_all_lengths']:.1f}%"
+            )
+
+    return aggregated
+
+
+def calculate_composite_score(metrics: dict[str, float], score_weights: dict[str, float] | None = None) -> float:
     """
     Calculate composite score for optimization.
 
     Different scoring strategies for different modes:
-    - Unconditional: Focus on plddt, tm_score, minimize PAE and RMSD
+    - Unconditional: Focus on diversity (foldseek clusters), with configurable weights for other metrics
     - Inverse folding: Focus on percent_identity, plddt, tm_score
     - Forward folding: Focus on tm_score, minimize RMSD
     - Inpainting: Focus on percent_identity_masked, rmsd_inpainted (post-alignment), tm_score, plddt
+
+    Args:
+        metrics: Dictionary of collected metrics
+        score_weights: Optional dictionary of weights for unconditional mode. Keys:
+            - diversity: weight per cluster (default 1.0)
+            - plddt: weight for pLDDT (default 0.05)
+            - tm_score: weight for TM-score (default 0.05)
+            - pae: weight for PAE penalty (default 0.05)
+            - rmsd: weight for RMSD penalty (default 0.05)
     """
     score = 0.0
+
+    # Default weights for unconditional mode
+    if score_weights is None:
+        score_weights = {
+            "diversity": 1.0,
+            "plddt": 0.05,
+            "tm_score": 0.05,
+            "pae": 0.05,
+            "rmsd": 0.05,
+        }
 
     # Determine mode from available metrics
     mode = "unconditional"  # default
@@ -203,19 +450,67 @@ def calculate_composite_score(metrics: dict[str, float]) -> float:
         mode = "forward_folding"
 
     if mode == "unconditional":
-        # Higher is better: plddt, tm_score
-        if "avg_plddt" in metrics:
-            score += metrics["avg_plddt"] * 0.3
+        # MAIN METRIC: Number of foldseek clusters (diversity) across ALL lengths
+        # Try to use aggregated metrics first (multi-length mode)
+        if "agg_total_clusters_all_lengths" in metrics:
+            # Multi-length mode: use aggregated total clusters
+            total_clusters = metrics["agg_total_clusters_all_lengths"]
+            diversity_score = total_clusters * score_weights["diversity"]
+            score += diversity_score
+            logger.info(
+                f"Diversity contribution to score (MAIN METRIC, ALL LENGTHS): {total_clusters} clusters * "
+                f"{score_weights['diversity']:.2f} weight = {diversity_score:.2f} points"
+            )
+        else:
+            # Single-length mode (backward compatible): sum clusters from individual length keys
+            cluster_keys = [k for k in metrics.keys() if k.startswith("diversity_num_clusters_")]
+            if cluster_keys:
+                total_clusters = sum(metrics[k] for k in cluster_keys)
+                diversity_score = total_clusters * score_weights["diversity"]
+                score += diversity_score
+                logger.info(
+                    f"Diversity contribution to score (MAIN METRIC): {total_clusters} clusters * "
+                    f"{score_weights['diversity']:.2f} weight = {diversity_score:.2f} points"
+                )
 
-        if "avg_tm_score" in metrics:
-            score += metrics["avg_tm_score"] * 0.3
+        # Secondary metrics (configurable weights)
+        # Use aggregated metrics if available (multi-length), otherwise use direct metrics (single-length)
+
+        # Higher is better: plddt, tm_score
+        plddt_key = "agg_avg_plddt" if "agg_avg_plddt" in metrics else "avg_plddt"
+        if plddt_key in metrics:
+            plddt_score = metrics[plddt_key] * score_weights["plddt"]
+            score += plddt_score
+            logger.debug(
+                f"pLDDT contribution: {metrics[plddt_key]:.2f} * {score_weights['plddt']:.2f} = {plddt_score:.2f}"
+            )
+
+        tm_key = "agg_avg_tm_score" if "agg_avg_tm_score" in metrics else "avg_tm_score"
+        if tm_key in metrics:
+            tm_score = metrics[tm_key] * score_weights["tm_score"]
+            score += tm_score
+            logger.debug(
+                f"TM-score contribution: {metrics[tm_key]:.2f} * {score_weights['tm_score']:.2f} = {tm_score:.2f}"
+            )
 
         # Lower is better: predicted_aligned_error, rmsd
-        if "avg_predicted_aligned_error" in metrics:
-            score -= metrics["avg_predicted_aligned_error"] / 100 * 0.2
+        pae_key = (
+            "agg_avg_predicted_aligned_error"
+            if "agg_avg_predicted_aligned_error" in metrics
+            else "avg_predicted_aligned_error"
+        )
+        if pae_key in metrics:
+            pae_penalty = metrics[pae_key] / 100 * score_weights["pae"]
+            score -= pae_penalty
+            logger.debug(f"PAE penalty: {metrics[pae_key]:.2f}/100 * {score_weights['pae']:.2f} = -{pae_penalty:.2f}")
 
-        if "avg_rmsd" in metrics:
-            score -= metrics["avg_rmsd"] / 10 * 0.2
+        rmsd_key = "agg_avg_rmsd" if "agg_avg_rmsd" in metrics else "avg_rmsd"
+        if rmsd_key in metrics:
+            rmsd_penalty = metrics[rmsd_key] / 10 * score_weights["rmsd"]
+            score -= rmsd_penalty
+            logger.debug(
+                f"RMSD penalty: {metrics[rmsd_key]:.2f}/10 * {score_weights['rmsd']:.2f} = -{rmsd_penalty:.2f}"
+            )
 
     elif mode == "inverse_folding":
         # Higher is better: percent_identity, plddt, tm_score

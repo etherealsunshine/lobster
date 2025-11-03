@@ -113,6 +113,9 @@ lg-gpu = [
     "bionemo-moco",
     "tmtools"
 ]
+anarci = [
+  "prescient-anarci"
+]
 mgm = [
     "selfies>=2.1.2",
 ]

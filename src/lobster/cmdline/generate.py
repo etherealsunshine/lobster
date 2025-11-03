@@ -1,11 +1,6 @@
 import logging
 from pathlib import Path
 import glob
-import csv
-from datetime import datetime
-import matplotlib.pyplot as plt
-import pandas as pd
-import numpy as np
 
 import hydra
 import torch
@@ -17,482 +12,26 @@ from lobster.model.latent_generator.utils.residue_constants import (
     convert_lobster_aa_tokenization_to_standard_aa,
     restype_order_with_x_inv,
 )
-from lobster.metrics import get_folded_structure_metrics, calculate_percent_identity
+from lobster.metrics import (
+    get_folded_structure_metrics,
+    calculate_percent_identity,
+    parse_mask_indices,
+    MetricsPlotter,
+    MetricsCSVWriter,
+    calculate_aggregate_stats,
+    align_and_compute_rmsd,
+    _is_sequence_pattern,
+    _create_sequence_pattern_masks,
+    build_multichain_sequence_string,
+    predict_structure_with_esmfold,
+)
+from lobster.metrics.cal_foldseek_clusters import calculate_diversity_for_generation
 from lobster.transforms._structure_transforms import StructureBackboneTransform, AminoAcidTokenizerTransform
 from tmtools import tm_align
 from lobster.model import LobsterPLMFold
-from lobster.model.latent_generator.utils import kabsch_torch_batched
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
-
-
-def add_linker_to_sequence(sequence: str, residue_index_offset: int = 512, chain_linker: str = "G" * 25):
-    """Add a linker to a sequence.
-    Args:
-        sequence: The sequence to encode
-        residue_index_offset: The offset for the residue indices
-        chain_linker: The linker to use for the chain breaks
-    Returns:
-        sequence: The sequence with linker
-        residx: The residue indices accounting for the linker
-        linker_mask: The mask for the linker
-    """
-
-    chains = sequence.split(":")
-    seq = chain_linker.join(chains)
-
-    residx = torch.arange(len(seq))
-
-    if residue_index_offset > 0:
-        start = 0
-        for i, chain in enumerate(chains):
-            residx[start : start + len(chain) + len(chain_linker)] += i * residue_index_offset
-            start += len(chain) + len(chain_linker)
-
-    linker_mask = torch.ones_like(residx, dtype=torch.float32)
-    offset = 0
-    for i, chain in enumerate(chains):
-        offset += len(chain)
-        linker_mask[offset : offset + len(chain_linker)] = 0
-        offset += len(chain_linker)
-
-    return seq, residx, linker_mask
-
-
-def parse_mask_indices(mask_spec: str | list | None, length: int, device: torch.device) -> torch.Tensor:
-    """Parse mask indices specification and return a binary mask tensor.
-
-    Args:
-        mask_spec: Specification of indices to mask. Can be:
-            - None or empty string "": return all-zero tensor (no masking)
-            - String with ranges: "10-20,30-35" (inclusive ranges)
-            - String with comma-separated indices: "10,15,20,25"
-            - List of integers: [10, 15, 20, 25]
-            - List of tuples for ranges: [(10, 20), (30, 35)]
-        length: Total length of the sequence/structure
-        device: Device to create the tensor on
-
-    Returns:
-        Binary mask tensor of shape (1, length) where 1=mask/generate, 0=keep fixed.
-        Returns all-zero tensor if mask_spec is None or empty string (no masking).
-    """
-    # Initialize mask with all zeros (keep all positions)
-    mask = torch.zeros((1, length), dtype=torch.long, device=device)
-
-    if mask_spec is None or mask_spec == "":
-        return mask
-
-    indices_to_mask = set()
-
-    if isinstance(mask_spec, str):
-        # Parse string specification
-        parts = mask_spec.split(",")
-        for part in parts:
-            part = part.strip()
-            if "-" in part:
-                # Range specification (e.g., "10-20")
-                start_str, end_str = part.split("-")
-                start = int(start_str.strip())
-                end = int(end_str.strip())
-                indices_to_mask.update(range(start, end + 1))  # Inclusive
-            else:
-                # Single index
-                indices_to_mask.add(int(part))
-
-    elif isinstance(mask_spec, list):
-        for item in mask_spec:
-            if isinstance(item, tuple):
-                # Range as tuple (start, end)
-                start, end = item
-                indices_to_mask.update(range(start, end + 1))  # Inclusive
-            elif isinstance(item, int):
-                # Single index
-                indices_to_mask.add(item)
-            else:
-                raise ValueError(f"Invalid mask specification item: {item}")
-
-    else:
-        raise ValueError(f"Invalid mask specification type: {type(mask_spec)}")
-
-    # Convert to mask tensor
-    for idx in indices_to_mask:
-        if 0 <= idx < length:
-            mask[0, idx] = 1
-        else:
-            logger.warning(f"Mask index {idx} out of bounds [0, {length}), ignoring")
-
-    num_masked = mask.sum().item()
-    logger.info(f"Parsed mask specification: {num_masked}/{length} positions to generate")
-
-    return mask
-
-
-class MetricsPlotter:
-    """Helper class to create plots from metrics data."""
-
-    def __init__(self, output_dir: Path, mode: str):
-        """Initialize plotter for a specific generation mode.
-
-        Args:
-            output_dir: Directory to save plot files
-            mode: Generation mode (unconditional, inverse_folding, forward_folding)
-        """
-        self.output_dir = output_dir
-        self.mode = mode
-        self.timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-    def create_box_plots_from_csv(self, csv_path: Path):
-        """Create box and whisker plots from CSV metrics data.
-
-        Args:
-            csv_path: Path to the CSV file containing metrics
-        """
-
-        # Read CSV data
-        df = pd.read_csv(csv_path)
-
-        # Define metrics to plot based on mode
-        if self.mode == "unconditional":
-            metrics = ["plddt", "predicted_aligned_error", "tm_score", "rmsd"]
-            length_col = "sequence_length"
-        elif self.mode == "inverse_folding":
-            metrics = ["percent_identity", "plddt", "predicted_aligned_error", "tm_score", "rmsd"]
-            length_col = "sequence_length"
-        elif self.mode == "forward_folding":
-            metrics = ["tm_score", "rmsd"]
-            length_col = "sequence_length"
-        elif self.mode == "inpainting":
-            metrics = [
-                "percent_identity_masked",
-                "percent_identity_unmasked",
-                "rmsd_inpainted",
-                "plddt",
-                "predicted_aligned_error",
-                "tm_score",
-                "rmsd",
-            ]
-            length_col = "sequence_length"
-        else:
-            logger.warning(f"Unknown mode for plotting: {self.mode}")
-            return
-
-        # Filter out empty values and convert to numeric
-        for metric in metrics:
-            if metric in df.columns:
-                df[metric] = pd.to_numeric(df[metric], errors="coerce")
-
-        # Remove rows with NaN values
-        df = df.dropna(subset=metrics)
-
-        if df.empty:
-            logger.warning("No valid data found for plotting")
-            return
-
-        # Create plots for each metric
-        for metric in metrics:
-            if metric not in df.columns:
-                continue
-
-            self._create_single_box_plot(df, metric, length_col)
-
-        # Create combined plot
-        self._create_combined_box_plot(df, metrics, length_col)
-
-    def _create_single_box_plot(self, df: pd.DataFrame, metric: str, length_col: str):
-        """Create a single box plot for one metric."""
-        plt.figure(figsize=(10, 6))
-
-        # Group data by length
-        lengths = sorted(df[length_col].unique())
-        data_by_length = [df[df[length_col] == length][metric].dropna() for length in lengths]
-
-        # Create box plot
-        box_plot = plt.boxplot(data_by_length, labels=lengths, patch_artist=True)
-
-        # Color the boxes
-        colors = plt.cm.Set3(np.linspace(0, 1, len(lengths)))
-        for patch, color in zip(box_plot["boxes"], colors):
-            patch.set_facecolor(color)
-            patch.set_alpha(0.7)
-
-        plt.title(
-            f"{metric.replace('_', ' ').title()} by Sequence Length\n({self.mode.replace('_', ' ').title()} Generation)"
-        )
-        plt.xlabel("Sequence Length")
-        plt.ylabel(metric.replace("_", " ").title())
-        plt.grid(True, alpha=0.3)
-
-        # Rotate x-axis labels if there are many lengths
-        if len(lengths) > 5:
-            plt.xticks(rotation=45)
-
-        plt.tight_layout()
-
-        # Save plot
-        plot_path = self.output_dir / f"{self.mode}_{metric}_boxplot_{self.timestamp}.png"
-        plt.savefig(plot_path, dpi=300, bbox_inches="tight")
-        plt.close()
-
-        logger.info(f"Saved box plot: {plot_path}")
-
-    def _create_combined_box_plot(self, df: pd.DataFrame, metrics: list, length_col: str):
-        """Create a combined subplot with all metrics."""
-        lengths = sorted(df[length_col].unique())
-
-        # Create subplots
-        fig, axes = plt.subplots(2, 2, figsize=(15, 12))
-        axes = axes.flatten()
-
-        for i, metric in enumerate(metrics):
-            if i >= len(axes):
-                break
-
-            ax = axes[i]
-
-            # Group data by length
-            data_by_length = [df[df[length_col] == length][metric].dropna() for length in lengths]
-
-            # Create box plot
-            box_plot = ax.boxplot(data_by_length, labels=lengths, patch_artist=True)
-
-            # Color the boxes
-            colors = plt.cm.Set3(np.linspace(0, 1, len(lengths)))
-            for patch, color in zip(box_plot["boxes"], colors):
-                patch.set_facecolor(color)
-                patch.set_alpha(0.7)
-
-            ax.set_title(f"{metric.replace('_', ' ').title()}")
-            ax.set_xlabel("Sequence Length")
-            ax.set_ylabel(metric.replace("_", " ").title())
-            ax.grid(True, alpha=0.3)
-
-            # Rotate x-axis labels if there are many lengths
-            if len(lengths) > 5:
-                ax.tick_params(axis="x", rotation=45)
-
-        # Hide unused subplots
-        for i in range(len(metrics), len(axes)):
-            axes[i].set_visible(False)
-
-        plt.suptitle(f"Metrics by Sequence Length - {self.mode.replace('_', ' ').title()} Generation", fontsize=16)
-        plt.tight_layout()
-
-        # Save combined plot
-        plot_path = self.output_dir / f"{self.mode}_combined_boxplots_{self.timestamp}.png"
-        plt.savefig(plot_path, dpi=300, bbox_inches="tight")
-        plt.close()
-
-        logger.info(f"Saved combined box plots: {plot_path}")
-
-
-class MetricsCSVWriter:
-    """Helper class to write metrics to CSV files."""
-
-    def __init__(self, output_dir: Path, mode: str):
-        """Initialize CSV writer for a specific generation mode.
-
-        Args:
-            output_dir: Directory to save CSV files
-            mode: Generation mode (unconditional, inverse_folding, forward_folding)
-        """
-        self.output_dir = output_dir
-        self.mode = mode
-        self.timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-        # Create CSV file path
-        self.csv_path = output_dir / f"{mode}_metrics_{self.timestamp}.csv"
-
-        # Initialize CSV file with headers
-        self._initialize_csv()
-
-    def _initialize_csv(self):
-        """Initialize CSV file with appropriate headers based on mode."""
-        headers = ["run_id", "timestamp", "mode"]
-
-        if self.mode == "unconditional":
-            headers.extend(["plddt", "predicted_aligned_error", "tm_score", "rmsd", "sequence_length", "num_samples"])
-        elif self.mode == "inverse_folding":
-            headers.extend(
-                [
-                    "percent_identity",
-                    "plddt",
-                    "predicted_aligned_error",
-                    "tm_score",
-                    "rmsd",
-                    "sequence_length",
-                    "input_file",
-                ]
-            )
-        elif self.mode == "forward_folding":
-            headers.extend(["tm_score", "rmsd", "sequence_length", "input_file"])
-        elif self.mode == "inpainting":
-            headers.extend(
-                [
-                    "percent_identity_masked",
-                    "percent_identity_unmasked",
-                    "rmsd_inpainted",
-                    "plddt",
-                    "predicted_aligned_error",
-                    "tm_score",
-                    "rmsd",
-                    "sequence_length",
-                    "num_masked_seq",
-                    "num_masked_struc",
-                    "input_file",
-                ]
-            )
-
-        # Write headers to CSV
-        with open(self.csv_path, "w", newline="") as csvfile:
-            writer = csv.writer(csvfile)
-            writer.writerow(headers)
-
-        logger.info(f"Initialized CSV metrics file: {self.csv_path}")
-
-    def write_batch_metrics(self, metrics: dict, run_id: str, **kwargs):
-        """Write batch metrics to CSV.
-
-        Args:
-            metrics: Dictionary containing metric values
-            run_id: Unique identifier for this run
-            **kwargs: Additional data to include (input_file, sequence_length, etc.)
-        """
-
-        def _to_scalar(value):
-            """Convert tensor to scalar value."""
-            if value is None or value == "":
-                return ""
-            if hasattr(value, "item"):
-                return value.item()
-            elif hasattr(value, "cpu"):
-                return value.cpu().item()
-            else:
-                return float(value)
-
-        row = [run_id, datetime.now().isoformat(), self.mode]
-
-        if self.mode == "unconditional":
-            row.extend(
-                [
-                    _to_scalar(metrics.get("_plddt", "")),
-                    _to_scalar(metrics.get("_predicted_aligned_error", "")),
-                    _to_scalar(metrics.get("_tm_score", "")),
-                    _to_scalar(metrics.get("_rmsd", "")),
-                    kwargs.get("sequence_length", ""),
-                    kwargs.get("num_samples", ""),
-                ]
-            )
-        elif self.mode == "inverse_folding":
-            row.extend(
-                [
-                    _to_scalar(kwargs.get("percent_identity", "")),
-                    _to_scalar(metrics.get("_plddt", "")),
-                    _to_scalar(metrics.get("_predicted_aligned_error", "")),
-                    _to_scalar(metrics.get("_tm_score", "")),
-                    _to_scalar(metrics.get("_rmsd", "")),
-                    kwargs.get("sequence_length", ""),
-                    kwargs.get("input_file", ""),
-                ]
-            )
-        elif self.mode == "forward_folding":
-            row.extend(
-                [
-                    _to_scalar(metrics.get("tm_score", "")),
-                    _to_scalar(metrics.get("rmsd", "")),
-                    kwargs.get("sequence_length", ""),
-                    kwargs.get("input_file", ""),
-                ]
-            )
-        elif self.mode == "inpainting":
-            row.extend(
-                [
-                    _to_scalar(kwargs.get("percent_identity_masked", "")),
-                    _to_scalar(kwargs.get("percent_identity_unmasked", "")),
-                    _to_scalar(kwargs.get("rmsd_inpainted", "")),
-                    _to_scalar(metrics.get("_plddt", "")),
-                    _to_scalar(metrics.get("_predicted_aligned_error", "")),
-                    _to_scalar(metrics.get("_tm_score", "")),
-                    _to_scalar(metrics.get("_rmsd", "")),
-                    kwargs.get("sequence_length", ""),
-                    kwargs.get("num_masked_seq", ""),
-                    kwargs.get("num_masked_struc", ""),
-                    kwargs.get("input_file", ""),
-                ]
-            )
-
-        # Write row to CSV
-        with open(self.csv_path, "a", newline="") as csvfile:
-            writer = csv.writer(csvfile)
-            writer.writerow(row)
-
-    def write_aggregate_stats(self, aggregate_stats: dict, length: int = None):
-        """Write aggregate statistics to a separate summary CSV.
-
-        Args:
-            aggregate_stats: Dictionary containing aggregate statistics
-            length: Optional length parameter for per-length aggregation
-        """
-        if length is not None:
-            summary_csv_path = self.output_dir / f"{self.mode}_summary_length_{length}_{self.timestamp}.csv"
-        else:
-            summary_csv_path = self.output_dir / f"{self.mode}_summary_{self.timestamp}.csv"
-
-        headers = ["metric", "value", "count", "mode", "timestamp"]
-        if length is not None:
-            headers.insert(-1, "length")
-
-        with open(summary_csv_path, "w", newline="") as csvfile:
-            writer = csv.writer(csvfile)
-            writer.writerow(headers)
-
-            for metric_name, (value, count) in aggregate_stats.items():
-                row = [metric_name, value, count, self.mode]
-                if length is not None:
-                    row.append(length)
-                row.append(datetime.now().isoformat())
-                writer.writerow(row)
-
-        logger.info(f"Saved aggregate statistics to: {summary_csv_path}")
-
-
-def _calculate_aggregate_stats(metric_lists: dict) -> dict:
-    """Calculate aggregate statistics from lists of metrics.
-
-    Args:
-        metric_lists: Dictionary mapping metric names to lists of values
-
-    Returns:
-        Dictionary mapping metric names to (average, count) tuples
-    """
-    aggregate_stats = {}
-
-    for metric_name, values in metric_lists.items():
-        if values:
-            # Convert tensors to scalars and filter out invalid values
-            valid_values = []
-            for v in values:
-                # Convert tensor to scalar if needed
-                if hasattr(v, "item"):
-                    scalar_v = v.item()
-                elif hasattr(v, "cpu"):
-                    scalar_v = v.cpu().item()
-                else:
-                    scalar_v = float(v)
-
-                # Filter out invalid values (inf, nan)
-                if scalar_v != float("inf") and not (isinstance(scalar_v, float) and scalar_v != scalar_v):
-                    valid_values.append(scalar_v)
-
-            if valid_values:
-                avg_value = sum(valid_values) / len(valid_values)
-                aggregate_stats[metric_name] = (avg_value, len(valid_values))
-            else:
-                aggregate_stats[metric_name] = (0.0, 0)
-        else:
-            aggregate_stats[metric_name] = (0.0, 0)
-
-    return aggregate_stats
 
 
 @hydra.main(version_base=None, config_path="../hydra_config", config_name="generate")
@@ -577,6 +116,735 @@ def generate(cfg: DictConfig) -> None:
     logger.info("Generation completed successfully!")
 
 
+def _check_sequence_tokens(
+    sequences: torch.Tensor, mask: torch.Tensor, stage_name: str = "generation"
+) -> tuple[bool, str]:
+    """Check if generated sequences contain only valid amino acid tokens.
+
+    Valid tokens are 0-19 (standard 20 amino acids).
+    Invalid tokens include:
+    - Token 20 (X = unknown amino acid)
+    - Tokens > 20 (mask/special tokens)
+    - Negative values
+
+    Args:
+        sequences: Sequence tensor (B, L) with amino acid token indices
+        mask: Validity mask (B, L) indicating which positions are valid
+        stage_name: Name of the generation stage for logging
+
+    Returns:
+        Tuple of (is_valid, error_message)
+        - is_valid: True if all sequences contain only valid tokens
+        - error_message: Description of the issue if invalid, empty string if valid
+    """
+    batch_size = sequences.shape[0]
+
+    for i in range(batch_size):
+        # Get valid positions for this sample
+        valid_positions = mask[i] == 1
+        seq_i = sequences[i, valid_positions]
+
+        # Check for unknown tokens (token 20 = X)
+        num_unknown = (seq_i == 20).sum().item()
+        if num_unknown > 0:
+            return False, f"Sample {i} in {stage_name} contains {num_unknown} unknown 'X' tokens (token 20)"
+
+        # Check for mask/special tokens (> 20)
+        num_mask = (seq_i > 20).sum().item()
+        if num_mask > 0:
+            return False, f"Sample {i} in {stage_name} contains {num_mask} mask/special tokens (> 20)"
+
+        # Check for negative values (should never happen, but check anyway)
+        num_negative = (seq_i < 0).sum().item()
+        if num_negative > 0:
+            return False, f"Sample {i} in {stage_name} contains negative token values"
+
+    return True, ""
+
+
+def _execute_self_reflection_pipeline(
+    model,
+    cfg: DictConfig,
+    device: torch.device,
+    output_dir: Path,
+    plm_fold,
+    generate_sample: dict,
+    mask: torch.Tensor,
+    iteration: int,
+    batch_size: int,
+    current_length: int,
+    save_structures: bool = False,
+) -> dict[str, float] | None:
+    """Execute self-reflection refinement pipeline to improve ESMFold metrics.
+
+    Pipeline: Unconditional → Forward Folding → Inverse Folding
+
+    This function refines unconditionally generated structure-sequence pairs through
+    forward folding (sequence → structure) and inverse folding (structure → sequence)
+    to improve consistency and ESMFold validation metrics.
+
+    The refined outputs (sequence₂, structure₃) should produce better ESMFold metrics
+    (higher pLDDT, higher TM-score, lower RMSD) compared to initial unconditional outputs.
+
+    Args:
+        model: genUME model
+        cfg: Configuration
+        device: torch device
+        output_dir: Output directory
+        plm_fold: ESMFold model (optional, but recommended for measuring improvement)
+        generate_sample: Raw output dict from unconditional model.generate_sample()
+        mask: Validity mask (B, L)
+        iteration: Current iteration number
+        batch_size: Batch size
+        current_length: Sequence length
+        save_structures: Whether to save structures
+    Returns:
+        Dictionary containing self-reflection metrics or None if pipeline failed
+    """
+    from lobster.transforms._structure_transforms import AminoAcidTokenizerTransform
+
+    gen_cfg = cfg.generation
+
+    try:
+        logger.info("=" * 80)
+        logger.info("SELF-REFLECTION REFINEMENT PIPELINE")
+        logger.info("=" * 80)
+
+        # Step 0: Extract sequences from unconditional generation (before decoding structure)
+        logger.info("Step 0: Extracting unconditional sequences...")
+
+        # Extract sequences
+        if generate_sample["sequence_logits"].shape[-1] == 33:
+            initial_seq = convert_lobster_aa_tokenization_to_standard_aa(
+                generate_sample["sequence_logits"], device=device
+            )
+        else:
+            initial_seq = generate_sample["sequence_logits"].argmax(dim=-1)
+            initial_seq[initial_seq > 21] = 20
+
+        logger.info(f"  Initial sequences shape: {initial_seq.shape}")
+
+        # Quality control check for invalid tokens BEFORE decoding structure
+        if hasattr(gen_cfg, "self_reflection") and hasattr(gen_cfg.self_reflection, "quality_control"):
+            qc_config = gen_cfg.self_reflection.quality_control
+            if qc_config.get("enable_sequence_token_check", True):  # Default True
+                is_valid, error_msg = _check_sequence_tokens(initial_seq, mask, "unconditional generation")
+                if not is_valid:
+                    logger.warning(f"  Quality control FAILED: {error_msg}")
+                    logger.warning("  Iteration will be retried (invalid sequence tokens)")
+                    logger.warning("  Skipping structure decoding and forward/inverse folding")
+                    return None
+                else:
+                    logger.info("  Quality control PASSED: All sequences contain valid amino acids")
+
+        # Now decode structures (only if sequences passed QC)
+        logger.info("  Decoding unconditional structures...")
+        decoded_x = model.decode_structure(generate_sample, mask)
+
+        # Extract coordinates
+        initial_structure = None
+        for decoder_name in decoded_x:
+            if "vit_decoder" == decoder_name:
+                initial_structure = decoded_x[decoder_name]
+                break
+
+        if initial_structure is None:
+            logger.error("No structure decoder found in model output")
+            return None
+
+        logger.info(f"  Initial structures shape: {initial_structure.shape}")
+
+        # Step 1: Prepare data for forward folding
+        logger.info("Step 1: Preparing data for forward folding...")
+        tokenizer_transform = AminoAcidTokenizerTransform(max_length=cfg.generation.get("max_length", 512))
+
+        # Tokenize initial sequences
+        padded_sequences = torch.zeros((batch_size, current_length), device=device, dtype=torch.long)
+        for i in range(batch_size):
+            seq_i = initial_seq[i, mask[i] == 1]
+            tokenized_data = tokenizer_transform({"sequence": seq_i.cpu()})
+            tokenized_seq = tokenized_data["sequence"]
+            seq_len = min(len(tokenized_seq), current_length)
+            padded_sequences[i, :seq_len] = tokenized_seq[:seq_len].to(device)
+
+        # Create indices from mask
+        indices = torch.arange(current_length, device=device).unsqueeze(0).expand(batch_size, -1)
+
+        # Step 2: Forward folding
+        logger.info("Step 2: Forward folding (sequence → structure refinement)...")
+        forward_params = _get_self_reflection_params(cfg, "forward_folding")
+        logger.info(f"  Forward folding parameters: {forward_params}")
+
+        forward_sample = model.generate_sample(
+            length=current_length,
+            num_samples=batch_size,
+            forward_folding=True,
+            input_sequence_tokens=padded_sequences,
+            input_mask=mask,
+            input_indices=indices,
+            nsteps=forward_params["nsteps"],
+            temperature_seq=forward_params["temperature_seq"],
+            temperature_struc=forward_params["temperature_struc"],
+            stochasticity_seq=forward_params["stochasticity_seq"],
+            stochasticity_struc=forward_params["stochasticity_struc"],
+            asynchronous_sampling=gen_cfg.get("asynchronous_sampling", False),
+        )
+
+        # Decode forward-folded structures
+        forward_decoded_x = model.decode_structure(forward_sample, mask)
+        forward_structure = None
+        for decoder_name in forward_decoded_x:
+            if "vit_decoder" == decoder_name:
+                forward_structure = forward_decoded_x[decoder_name]
+                break
+
+        if forward_structure is None:
+            logger.error("No structure decoder found in forward folding output")
+            return None
+
+        # Extract forward-folded sequences
+        if forward_sample["sequence_logits"].shape[-1] == 33:
+            forward_seq = convert_lobster_aa_tokenization_to_standard_aa(
+                forward_sample["sequence_logits"], device=device
+            )
+        else:
+            forward_seq = forward_sample["sequence_logits"].argmax(dim=-1)
+            forward_seq[forward_seq > 21] = 20
+
+        # Calculate TM-score and RMSD between unconditional and forward-folded
+        tm_scores_uncond_to_forward = []
+        rmsd_uncond_to_forward = []
+
+        for i in range(batch_size):
+            orig_coords = initial_structure[i, mask[i] == 1, :, :]
+            forward_coords = forward_structure[i, mask[i] == 1, :, :]
+            seq_i = initial_seq[i, mask[i] == 1]
+            sequence_str = "".join([restype_order_with_x_inv[j.item()] for j in seq_i])
+
+            # TM-align RMSD
+            tm_out = tm_align(
+                forward_coords[:, 1, :].cpu().numpy(),
+                orig_coords[:, 1, :].detach().cpu().numpy(),
+                sequence_str,
+                sequence_str,
+            )
+            tm_scores_uncond_to_forward.append(tm_out.tm_norm_chain1)
+
+            # Kabsch RMSD
+            rmsd = align_and_compute_rmsd(
+                coords1=forward_coords,
+                coords2=orig_coords,
+                mask=None,  # Use all positions
+                return_aligned=False,
+                device=device,
+            )
+            rmsd_uncond_to_forward.append(rmsd)
+
+        avg_tm_uncond_to_forward = sum(tm_scores_uncond_to_forward) / len(tm_scores_uncond_to_forward)
+        avg_rmsd_uncond_to_forward = sum(rmsd_uncond_to_forward) / len(rmsd_uncond_to_forward)
+
+        logger.info(
+            f"  Unconditional → Forward: TM-score={avg_tm_uncond_to_forward:.3f}, "
+            f"RMSD={avg_rmsd_uncond_to_forward:.2f}Å"
+        )
+
+        # Quality control check: Verify forward folding TM-score meets threshold
+        if hasattr(gen_cfg, "self_reflection") and hasattr(gen_cfg.self_reflection, "quality_control"):
+            qc_config = gen_cfg.self_reflection.quality_control
+            if qc_config.get("enable_tm_threshold", False):
+                min_tm_score = qc_config.get("min_tm_score_forward", 0.7)
+                if avg_tm_uncond_to_forward < min_tm_score:
+                    logger.warning(
+                        f"  Quality control FAILED: Forward folding TM-score "
+                        f"{avg_tm_uncond_to_forward:.3f} < threshold {min_tm_score:.3f}"
+                    )
+                    logger.warning("  Iteration will be retried")
+                    return None
+                else:
+                    logger.info(
+                        f"  Quality control PASSED: TM-score {avg_tm_uncond_to_forward:.3f} "
+                        f">= threshold {min_tm_score:.3f}"
+                    )
+
+        # Save forward-folded structures
+        if save_structures:
+            for i in range(batch_size):
+                filename = output_dir / (
+                    f"self_reflection_forward_length_{current_length}_iter_{iteration:03d}_sample_{i:02d}.pdb"
+                )
+                forward_structure_i = forward_structure[i, mask[i] == 1]
+                forward_seq_i = forward_seq[i, mask[i] == 1]
+                writepdb(str(filename), forward_structure_i, forward_seq_i)
+
+        logger.info("  Saved forward-folded structures")
+
+        # Step 3: Inverse folding
+        logger.info("Step 3: Inverse folding (structure → sequence refinement)...")
+        inverse_params = _get_self_reflection_params(cfg, "inverse_folding")
+        logger.info(f"  Inverse folding parameters: {inverse_params}")
+
+        inverse_sample = model.generate_sample(
+            length=current_length,
+            num_samples=batch_size,
+            inverse_folding=True,
+            input_structure_coords=forward_structure,
+            input_mask=mask,
+            input_indices=indices,
+            nsteps=inverse_params["nsteps"],
+            temperature_seq=inverse_params["temperature_seq"],
+            stochasticity_seq=inverse_params["stochasticity_seq"],
+            asynchronous_sampling=gen_cfg.get("asynchronous_sampling", False),
+        )
+
+        # Decode inverse-folded structures
+        inverse_decoded_x = model.decode_structure(inverse_sample, mask)
+        inverse_structure = None
+        for decoder_name in inverse_decoded_x:
+            if "vit_decoder" == decoder_name:
+                inverse_structure = inverse_decoded_x[decoder_name]
+                break
+
+        if inverse_structure is None:
+            logger.error("No structure decoder found in inverse folding output")
+            return None
+
+        # Extract inverse-folded sequences (refined)
+        if inverse_sample["sequence_logits"].shape[-1] == 33:
+            refined_seq = convert_lobster_aa_tokenization_to_standard_aa(
+                inverse_sample["sequence_logits"], device=device
+            )
+        else:
+            refined_seq = inverse_sample["sequence_logits"].argmax(dim=-1)
+            refined_seq[refined_seq > 21] = 20
+
+        # Save inverse-folded (refined) structures
+        if save_structures:
+            for i in range(batch_size):
+                filename = output_dir / (
+                    f"self_reflection_inverse_length_{current_length}_iter_{iteration:03d}_sample_{i:02d}.pdb"
+                )
+                inverse_structure_i = inverse_structure[i, mask[i] == 1]
+                refined_seq_i = refined_seq[i, mask[i] == 1]
+                writepdb(str(filename), inverse_structure_i, refined_seq_i)
+
+        logger.info("  Saved inverse-folded (refined) structures")
+
+        # Calculate TM-score and RMSD between forward and inverse-folded
+        tm_scores_forward_to_inverse = []
+        rmsd_forward_to_inverse = []
+
+        for i in range(batch_size):
+            forward_coords = forward_structure[i, mask[i] == 1, :, :]
+            inverse_coords = inverse_structure[i, mask[i] == 1, :, :]
+            seq_i = refined_seq[i, mask[i] == 1]
+            sequence_str = "".join([restype_order_with_x_inv[j.item()] for j in seq_i])
+
+            # TM-align RMSD
+            tm_out = tm_align(
+                inverse_coords[:, 1, :].cpu().numpy(),
+                forward_coords[:, 1, :].detach().cpu().numpy(),
+                sequence_str,
+                sequence_str,
+            )
+            tm_scores_forward_to_inverse.append(tm_out.tm_norm_chain1)
+
+            # Kabsch RMSD
+            rmsd = align_and_compute_rmsd(
+                coords1=inverse_coords,
+                coords2=forward_coords,
+                mask=None,  # Use all positions
+                return_aligned=False,
+                device=device,
+            )
+            rmsd_forward_to_inverse.append(rmsd)
+
+        avg_tm_forward_to_inverse = sum(tm_scores_forward_to_inverse) / len(tm_scores_forward_to_inverse)
+        avg_rmsd_forward_to_inverse = sum(rmsd_forward_to_inverse) / len(rmsd_forward_to_inverse)
+
+        logger.info(
+            f"  Forward → Inverse: TM-score={avg_tm_forward_to_inverse:.3f}, RMSD={avg_rmsd_forward_to_inverse:.2f}Å"
+        )
+
+        # Step 4: Sequence recovery metrics
+        logger.info("Step 4: Calculating sequence recovery metrics...")
+        percent_identities = []
+
+        for i in range(batch_size):
+            orig_seq = initial_seq[i, mask[i] == 1]
+            ref_seq = refined_seq[i, mask[i] == 1]
+            min_len = min(len(orig_seq), len(ref_seq))
+
+            if min_len > 0:
+                percent_identity = calculate_percent_identity(
+                    orig_seq[:min_len].unsqueeze(0), ref_seq[:min_len].unsqueeze(0)
+                )
+                percent_identities.append(percent_identity.item())
+            else:
+                percent_identities.append(0.0)
+
+        avg_percent_identity = sum(percent_identities) / len(percent_identities)
+        logger.info(f"  Sequence identity (initial → refined): {avg_percent_identity:.2f}%")
+
+        # Quality control check: Verify percent identity meets thresholds
+        if hasattr(gen_cfg, "self_reflection") and hasattr(gen_cfg.self_reflection, "quality_control"):
+            qc_config = gen_cfg.self_reflection.quality_control
+
+            # Check minimum percent identity (too low = too much change)
+            if qc_config.get("enable_min_percent_identity_threshold", False):
+                min_percent_identity = qc_config.get("min_percent_identity", 20.0)
+                if avg_percent_identity < min_percent_identity:
+                    logger.warning(
+                        f"  Quality control FAILED: Percent identity "
+                        f"{avg_percent_identity:.2f}% < minimum threshold {min_percent_identity:.2f}%"
+                    )
+                    logger.warning("  Iteration will be retried (too much sequence change)")
+                    return None
+                else:
+                    logger.info(
+                        f"  Quality control PASSED: Percent identity {avg_percent_identity:.2f}% "
+                        f">= minimum threshold {min_percent_identity:.2f}%"
+                    )
+
+            # Check maximum percent identity (too high = insufficient refinement)
+            if qc_config.get("enable_max_percent_identity_threshold", False):
+                max_percent_identity = qc_config.get("max_percent_identity", 90.0)
+                if avg_percent_identity > max_percent_identity:
+                    logger.warning(
+                        f"  Quality control FAILED: Percent identity "
+                        f"{avg_percent_identity:.2f}% > maximum threshold {max_percent_identity:.2f}%"
+                    )
+                    logger.warning("  Iteration will be retried (insufficient sequence refinement)")
+                    return None
+                else:
+                    logger.info(
+                        f"  Quality control PASSED: Percent identity {avg_percent_identity:.2f}% "
+                        f"<= maximum threshold {max_percent_identity:.2f}%"
+                    )
+
+        # Step 4.5: ESMFold Validation (if enabled and available)
+        esmfold_metrics = {}
+        use_esmfold_validation = False
+        if hasattr(gen_cfg, "self_reflection"):
+            use_esmfold_validation = gen_cfg.self_reflection.get("use_esmfold_validation", False)
+
+        if plm_fold is not None and use_esmfold_validation:
+            logger.info("Step 4.5: ESMFold Validation...")
+
+            # Substep A: Fold unconditional sequences (baseline)
+            logger.info("  Folding unconditional sequences (baseline)...")
+            plddt_unconditional_list = []
+            pae_unconditional_list = []
+            tm_esmfold_unconditional_list = []
+            rmsd_esmfold_unconditional_list = []
+            folded_coords_unconditional = []  # Store ESMFold predictions for structure comparison
+
+            for i in range(batch_size):
+                # Convert sequence to string
+                seq_i = initial_seq[i, mask[i] == 1]
+                sequence_str = "".join([restype_order_with_x_inv[j.item()] for j in seq_i])
+
+                # Tokenize sequence
+                tokenized_input = plm_fold.tokenizer.encode_plus(
+                    sequence_str,
+                    padding=True,
+                    truncation=True,
+                    max_length=cfg.generation.get("max_length", 512),
+                    add_special_tokens=False,
+                    return_tensors="pt",
+                )["input_ids"].to(device)
+
+                # Fold with ESMFold
+                with torch.no_grad():
+                    esmfold_outputs = plm_fold.model(tokenized_input)
+
+                # Get reference structure
+                ref_coords = initial_structure[i, mask[i] == 1, :, :].unsqueeze(0)
+
+                # Calculate metrics
+                folded_metrics, folded_coords = get_folded_structure_metrics(
+                    esmfold_outputs, ref_coords, [sequence_str], mask=mask[i : i + 1], device=device
+                )
+
+                plddt_unconditional_list.append(folded_metrics["_plddt"])
+                pae_unconditional_list.append(folded_metrics["_predicted_aligned_error"])
+                tm_esmfold_unconditional_list.append(folded_metrics["_tm_score"])
+                rmsd_esmfold_unconditional_list.append(folded_metrics["_rmsd"])
+
+                # Store ESMFold predicted coordinates for structure comparison
+                folded_coords_unconditional.append(folded_coords[0])
+
+                # Save ESMFold baseline structure
+                filename = output_dir / (
+                    f"self_reflection_unconditional_esmfold_length_{current_length}_iter_{iteration:03d}_sample_{i:02d}.pdb"
+                )
+                folded_coords_i = folded_coords[0, mask[i] == 1]
+                seq_i_masked = initial_seq[i, mask[i] == 1]
+                writepdb(str(filename), folded_coords_i, seq_i_masked)
+
+            avg_plddt_unconditional = sum(plddt_unconditional_list) / len(plddt_unconditional_list)
+            avg_pae_unconditional = sum(pae_unconditional_list) / len(pae_unconditional_list)
+            avg_tm_esmfold_unconditional = sum(tm_esmfold_unconditional_list) / len(tm_esmfold_unconditional_list)
+            avg_rmsd_esmfold_unconditional = sum(rmsd_esmfold_unconditional_list) / len(rmsd_esmfold_unconditional_list)
+
+            logger.info(f"    pLDDT: {avg_plddt_unconditional:.2f}")
+            logger.info(
+                f"    TM-score: {avg_tm_esmfold_unconditional:.3f}, RMSD: {avg_rmsd_esmfold_unconditional:.2f}Å"
+            )
+
+            # Substep B: Compare unconditional structures to ESMFold predictions
+            logger.info("  Comparing unconditional structures to ESMFold predictions...")
+            tm_scores_unconditional_to_esmfold = []
+            rmsd_unconditional_to_esmfold = []
+
+            for i in range(batch_size):
+                # Get unconditional structure and ESMFold prediction
+                uncond_coords = initial_structure[i, mask[i] == 1, :, :]
+                esmfold_coords = folded_coords_unconditional[i][mask[i] == 1]
+                seq_i = initial_seq[i, mask[i] == 1]
+                sequence_str = "".join([restype_order_with_x_inv[j.item()] for j in seq_i])
+
+                # TM-align
+                tm_out = tm_align(
+                    uncond_coords[:, 1, :].cpu().numpy(),
+                    esmfold_coords[:, 1, :].detach().cpu().numpy(),
+                    sequence_str,
+                    sequence_str,
+                )
+                tm_scores_unconditional_to_esmfold.append(tm_out.tm_norm_chain1)
+
+                # Kabsch RMSD
+                rmsd = align_and_compute_rmsd(
+                    coords1=uncond_coords,
+                    coords2=esmfold_coords,
+                    mask=None,
+                    return_aligned=False,
+                    device=device,
+                )
+                rmsd_unconditional_to_esmfold.append(rmsd)
+
+            avg_tm_unconditional_to_esmfold = sum(tm_scores_unconditional_to_esmfold) / len(
+                tm_scores_unconditional_to_esmfold
+            )
+            avg_rmsd_unconditional_to_esmfold = sum(rmsd_unconditional_to_esmfold) / len(rmsd_unconditional_to_esmfold)
+
+            logger.info(
+                f"    Unconditional → ESMFold: TM-score={avg_tm_unconditional_to_esmfold:.3f}, "
+                f"RMSD={avg_rmsd_unconditional_to_esmfold:.2f}Å"
+            )
+
+            # Substep C: Fold refined sequences (improved)
+            logger.info("  Folding refined sequences (improved)...")
+            plddt_refined_list = []
+            pae_refined_list = []
+            tm_esmfold_refined_list = []
+            rmsd_esmfold_refined_list = []
+            folded_coords_refined = []  # Store ESMFold predictions for structure comparison
+
+            for i in range(batch_size):
+                # Convert refined sequence to string
+                seq_i = refined_seq[i, mask[i] == 1]
+                sequence_str = "".join([restype_order_with_x_inv[j.item()] for j in seq_i])
+
+                # Tokenize sequence
+                tokenized_input = plm_fold.tokenizer.encode_plus(
+                    sequence_str,
+                    padding=True,
+                    truncation=True,
+                    max_length=cfg.generation.get("max_length", 512),
+                    add_special_tokens=False,
+                    return_tensors="pt",
+                )["input_ids"].to(device)
+
+                # Fold with ESMFold
+                with torch.no_grad():
+                    esmfold_outputs = plm_fold.model(tokenized_input)
+
+                # Get reference structure (inverse folded structure)
+                ref_coords = inverse_structure[i, mask[i] == 1, :, :].unsqueeze(0)
+
+                # Calculate metrics
+                folded_metrics, folded_coords = get_folded_structure_metrics(
+                    esmfold_outputs, ref_coords, [sequence_str], mask=mask[i : i + 1], device=device
+                )
+
+                plddt_refined_list.append(folded_metrics["_plddt"])
+                pae_refined_list.append(folded_metrics["_predicted_aligned_error"])
+                tm_esmfold_refined_list.append(folded_metrics["_tm_score"])
+                rmsd_esmfold_refined_list.append(folded_metrics["_rmsd"])
+
+                # Store ESMFold predicted coordinates for structure comparison
+                folded_coords_refined.append(folded_coords[0])
+
+                # Save ESMFold refined structure
+                filename = output_dir / (
+                    f"self_reflection_refined_esmfold_length_{current_length}_iter_{iteration:03d}_sample_{i:02d}.pdb"
+                )
+                folded_coords_i = folded_coords[0, mask[i] == 1]
+                seq_i_masked = refined_seq[i, mask[i] == 1]
+                writepdb(str(filename), folded_coords_i, seq_i_masked)
+
+            avg_plddt_refined = sum(plddt_refined_list) / len(plddt_refined_list)
+            avg_pae_refined = sum(pae_refined_list) / len(pae_refined_list)
+            avg_tm_esmfold_refined = sum(tm_esmfold_refined_list) / len(tm_esmfold_refined_list)
+            avg_rmsd_esmfold_refined = sum(rmsd_esmfold_refined_list) / len(rmsd_esmfold_refined_list)
+
+            logger.info(f"    pLDDT: {avg_plddt_refined:.2f}")
+            logger.info(f"    TM-score: {avg_tm_esmfold_refined:.3f}, RMSD: {avg_rmsd_esmfold_refined:.2f}Å")
+
+            # Substep D: Compare forward-folded structures to ESMFold predictions
+            logger.info("  Comparing forward-folded structures to ESMFold predictions...")
+            tm_scores_forward_to_esmfold = []
+            rmsd_forward_to_esmfold = []
+
+            for i in range(batch_size):
+                # Get forward-folded structure and ESMFold prediction from unconditional sequence
+                forward_coords = forward_structure[i, mask[i] == 1, :, :]
+                esmfold_coords = folded_coords_unconditional[i][mask[i] == 1]
+                seq_i = initial_seq[i, mask[i] == 1]
+                sequence_str = "".join([restype_order_with_x_inv[j.item()] for j in seq_i])
+
+                # TM-align
+                tm_out = tm_align(
+                    forward_coords[:, 1, :].cpu().numpy(),
+                    esmfold_coords[:, 1, :].detach().cpu().numpy(),
+                    sequence_str,
+                    sequence_str,
+                )
+                tm_scores_forward_to_esmfold.append(tm_out.tm_norm_chain1)
+
+                # Kabsch RMSD
+                rmsd = align_and_compute_rmsd(
+                    coords1=forward_coords,
+                    coords2=esmfold_coords,
+                    mask=None,
+                    return_aligned=False,
+                    device=device,
+                )
+                rmsd_forward_to_esmfold.append(rmsd)
+
+            avg_tm_forward_to_esmfold = sum(tm_scores_forward_to_esmfold) / len(tm_scores_forward_to_esmfold)
+            avg_rmsd_forward_to_esmfold = sum(rmsd_forward_to_esmfold) / len(rmsd_forward_to_esmfold)
+
+            logger.info(
+                f"    Forward-folded → ESMFold: TM-score={avg_tm_forward_to_esmfold:.3f}, "
+                f"RMSD={avg_rmsd_forward_to_esmfold:.2f}Å"
+            )
+
+            # Substep E: Calculate ESMFold agreement improvement
+            tm_esmfold_agreement_improvement = avg_tm_forward_to_esmfold - avg_tm_unconditional_to_esmfold
+            rmsd_esmfold_agreement_improvement = avg_rmsd_unconditional_to_esmfold - avg_rmsd_forward_to_esmfold
+
+            logger.info("  ESMFold Agreement Improvement:")
+            logger.info(
+                f"    TM-score improvement: {tm_esmfold_agreement_improvement:+.3f} "
+                f"(Unconditional→Forward better agreement with ESMFold)"
+            )
+            logger.info(
+                f"    RMSD improvement: {rmsd_esmfold_agreement_improvement:+.2f}Å "
+                f"(Positive = Forward closer to ESMFold)"
+            )
+
+            # Substep F: Calculate baseline improvements
+            plddt_improvement = avg_plddt_refined - avg_plddt_unconditional
+            pae_improvement = avg_pae_unconditional - avg_pae_refined
+            tm_improvement = avg_tm_esmfold_refined - avg_tm_esmfold_unconditional
+            rmsd_improvement = avg_rmsd_esmfold_unconditional - avg_rmsd_esmfold_refined
+
+            logger.info("  Improvement Summary:")
+            logger.info(
+                f"    pLDDT: {plddt_improvement:+.2f} ({plddt_improvement / avg_plddt_unconditional * 100:+.1f}%)"
+            )
+            logger.info(f"    PAE: {pae_improvement:+.2f}Å")
+            logger.info(f"    TM-score: {tm_improvement:+.3f}")
+            logger.info(f"    RMSD: {rmsd_improvement:+.2f}Å")
+
+            # Store ESMFold metrics
+            esmfold_metrics = {
+                "plddt_unconditional": avg_plddt_unconditional,
+                "pae_unconditional": avg_pae_unconditional,
+                "tm_score_esmfold_unconditional": avg_tm_esmfold_unconditional,
+                "rmsd_esmfold_unconditional": avg_rmsd_esmfold_unconditional,
+                "plddt_refined": avg_plddt_refined,
+                "pae_refined": avg_pae_refined,
+                "tm_score_esmfold_refined": avg_tm_esmfold_refined,
+                "rmsd_esmfold_refined": avg_rmsd_esmfold_refined,
+                "plddt_improvement": plddt_improvement,
+                "pae_improvement": pae_improvement,
+                "tm_score_improvement": tm_improvement,
+                "rmsd_improvement": rmsd_improvement,
+                # ESMFold structure comparison metrics
+                "tm_score_unconditional_to_esmfold": avg_tm_unconditional_to_esmfold,
+                "rmsd_unconditional_to_esmfold": avg_rmsd_unconditional_to_esmfold,
+                "tm_score_forward_to_esmfold": avg_tm_forward_to_esmfold,
+                "rmsd_forward_to_esmfold": avg_rmsd_forward_to_esmfold,
+                "tm_score_esmfold_agreement_improvement": tm_esmfold_agreement_improvement,
+                "rmsd_esmfold_agreement_improvement": rmsd_esmfold_agreement_improvement,
+            }
+        else:
+            if plm_fold is None:
+                logger.info("Step 4.5: Skipping ESMFold validation (ESMFold model not available)")
+            elif not use_esmfold_validation:
+                logger.info("Step 4.5: Skipping ESMFold validation (disabled in self_reflection config)")
+
+        # Step 5: Return metrics
+        metrics = {
+            "percent_identity_self_reflection": avg_percent_identity,
+            "tm_score_unconditional_to_forward": avg_tm_uncond_to_forward,
+            "rmsd_unconditional_to_forward": avg_rmsd_uncond_to_forward,
+            "tm_score_forward_to_inverse": avg_tm_forward_to_inverse,
+            "rmsd_forward_to_inverse": avg_rmsd_forward_to_inverse,
+        }
+
+        # Add ESMFold metrics if available
+        metrics.update(esmfold_metrics)
+
+        logger.info("=" * 80)
+        logger.info("Self-reflection refinement pipeline completed successfully")
+        logger.info("=" * 80)
+
+        return metrics
+
+    except Exception as e:
+        logger.error(f"Self-reflection pipeline failed: {e}")
+        import traceback
+
+        traceback.print_exc()
+        return None
+
+
+def _get_self_reflection_params(cfg: DictConfig, stage: str) -> dict:
+    """Get generation parameters for self-reflection pipeline stage with fallback.
+
+    Args:
+        cfg: Configuration
+        stage: Either 'forward_folding' or 'inverse_folding'
+
+    Returns:
+        Dictionary of generation parameters
+    """
+    gen_cfg = cfg.generation
+
+    # Try to get stage-specific parameters
+    if hasattr(gen_cfg, "self_reflection") and hasattr(gen_cfg.self_reflection, stage):
+        stage_cfg = getattr(gen_cfg.self_reflection, stage)
+        return {
+            "nsteps": stage_cfg.get("nsteps", 100 if stage == "forward_folding" else 200),
+            "temperature_seq": stage_cfg.get("temperature_seq", gen_cfg.get("temperature_seq", 0.5)),
+            "temperature_struc": stage_cfg.get("temperature_struc", gen_cfg.get("temperature_struc", 1.0)),
+            "stochasticity_seq": stage_cfg.get("stochasticity_seq", gen_cfg.get("stochasticity_seq", 20)),
+            "stochasticity_struc": stage_cfg.get("stochasticity_struc", gen_cfg.get("stochasticity_struc", 20)),
+        }
+
+    # Fallback to main generation parameters
+    return {
+        "nsteps": gen_cfg.get("nsteps", 100 if stage == "forward_folding" else 200),
+        "temperature_seq": gen_cfg.get("temperature_seq", 0.5),
+        "temperature_struc": gen_cfg.get("temperature_struc", 1.0),
+        "stochasticity_seq": gen_cfg.get("stochasticity_seq", 20),
+        "stochasticity_struc": gen_cfg.get("stochasticity_struc", 20),
+    }
+
+
 def _generate_unconditional(
     model, cfg: DictConfig, device: torch.device, output_dir: Path, plm_fold=None, csv_writer=None, plotter=None
 ) -> None:
@@ -616,90 +884,220 @@ def _generate_unconditional(
         # Initialize metrics collection for this length
         all_metrics = []
 
+        # Get quality control config for retry logic
+        qc_config = {}
+        if hasattr(gen_cfg, "self_reflection") and hasattr(gen_cfg.self_reflection, "quality_control"):
+            qc_config = gen_cfg.self_reflection.quality_control
+
+        # Enable retries if any QC threshold is enabled
+        qc_enabled = (
+            qc_config.get("enable_tm_threshold", False)
+            or qc_config.get("enable_min_percent_identity_threshold", False)
+            or qc_config.get("enable_max_percent_identity_threshold", False)
+            or qc_config.get("enable_sequence_token_check", True)  # Token check enabled by default
+        )
+        max_retries = qc_config.get("max_retries", 3) if qc_enabled else 0
+
+        # Track retry statistics
+        total_retries = 0
+        max_retries_exceeded = 0
+
         for n_iter in range(n_iterations):
             logger.info(f"Iteration {n_iter + 1}/{n_iterations}")
 
-            with torch.no_grad():
-                # Generate samples
-                generate_sample = model.generate_sample(
-                    length=current_length,
-                    num_samples=batch_size,
-                    nsteps=nsteps,
-                    temperature_seq=gen_cfg.get("temperature_seq", 0.5),
-                    temperature_struc=gen_cfg.get("temperature_struc", 1.0),
-                    stochasticity_seq=gen_cfg.get("stochasticity_seq", 20),
-                    stochasticity_struc=gen_cfg.get("stochasticity_struc", 20),
-                )
+            # Retry loop for quality control
+            retry_count = 0
+            iteration_success = False
 
-                # Create mask for decoding
-                mask = torch.ones((batch_size, current_length), device=device)
+            while retry_count <= max_retries and not iteration_success:
+                if retry_count > 0:
+                    logger.info(f"  Retry attempt {retry_count}/{max_retries} for iteration {n_iter + 1}")
+                    total_retries += 1
 
-                # Decode structures
-                decoded_x = model.decode_structure(generate_sample, mask)
-
-                # Extract coordinates
-                x_recon_xyz = None
-                for decoder_name in decoded_x:
-                    if "vit_decoder" == decoder_name:
-                        x_recon_xyz = decoded_x[decoder_name]
-                        break
-
-                if x_recon_xyz is None:
-                    raise RuntimeError("No structure decoder found in model output")
-
-                # Extract sequences
-                if generate_sample["sequence_logits"].shape[-1] == 33:
-                    seq = convert_lobster_aa_tokenization_to_standard_aa(
-                        generate_sample["sequence_logits"], device=device
-                    )
-                else:
-                    seq = generate_sample["sequence_logits"].argmax(dim=-1)
-                    seq[seq > 21] = 20
-
-                # Save generated structures
-                logger.info("Saving generated structures...")
-                for i in range(batch_size):
-                    filename = (
-                        output_dir / f"generated_structure_length_{current_length}_{n_iter * batch_size + i:03d}.pdb"
-                    )
-                    writepdb(str(filename), x_recon_xyz[i], seq[i])
-                    logger.info(f"Saved: {filename}")
-
-                # Optional ESMFold validation
-                if plm_fold is not None:
-                    logger.info("Validating structures with ESMFold...")
-                    batch_metrics = _validate_with_esmfold(
-                        seq,
-                        x_recon_xyz,
-                        plm_fold,
-                        device,
-                        output_dir,
-                        f"generated_structure_length_{current_length}_{n_iter * batch_size + i:03d}",
-                        max_length=current_length,
+                with torch.no_grad():
+                    # Generate samples
+                    generate_sample = model.generate_sample(
+                        length=current_length,
+                        num_samples=batch_size,
+                        nsteps=nsteps,
+                        temperature_seq=gen_cfg.get("temperature_seq", 0.5),
+                        temperature_struc=gen_cfg.get("temperature_struc", 1.0),
+                        stochasticity_seq=gen_cfg.get("stochasticity_seq", 20),
+                        stochasticity_struc=gen_cfg.get("stochasticity_struc", 20),
+                        asynchronous_sampling=gen_cfg.get("asynchronous_sampling", False),
                     )
 
-                    # Log metrics for unconditional generation
-                    if batch_metrics:
-                        logger.info("ESMFold validation metrics for unconditional generation:")
-                        for key, value in batch_metrics.items():
-                            logger.info(f"  {key}: {value:.4f}")
+                    # Create mask for decoding
+                    mask = torch.ones((batch_size, current_length), device=device)
 
-                        # Store metrics for CSV logging
-                        if csv_writer is not None:
-                            run_id = f"unconditional_length_{current_length}_iter_{n_iter:03d}"
-                            csv_writer.write_batch_metrics(
-                                batch_metrics, run_id, sequence_length=current_length, num_samples=batch_size
-                            )
+                    # Self-reflection refinement pipeline (if enabled)
+                    self_reflection_metrics = None
+                    if gen_cfg.get("enable_self_reflection", False):
+                        logger.info("Executing self-reflection refinement pipeline...")
+                        self_reflection_metrics = _execute_self_reflection_pipeline(
+                            model=model,
+                            cfg=cfg,
+                            device=device,
+                            output_dir=output_dir,
+                            plm_fold=plm_fold,
+                            generate_sample=generate_sample,
+                            mask=mask,
+                            iteration=n_iter,
+                            batch_size=batch_size,
+                            current_length=current_length,
+                        )
 
-                        # Always collect metrics for aggregate statistics
-                        all_metrics.append(batch_metrics)
+                        if self_reflection_metrics is not None:
+                            # Success! Store self-reflection metrics for aggregate statistics
+                            all_metrics.append(self_reflection_metrics)
+
+                            # Write to CSV if writer is available
+                            if csv_writer is not None:
+                                run_id = f"self_reflection_length_{current_length}_iter_{n_iter:03d}"
+                                csv_writer.write_batch_metrics(
+                                    self_reflection_metrics,
+                                    run_id,
+                                    sequence_length=current_length,
+                                    num_samples=batch_size,
+                                )
+                            iteration_success = True
+                        else:
+                            # Quality control failed, will retry
+                            retry_count += 1
+                            if retry_count > max_retries:
+                                logger.error(
+                                    f"  Max retries ({max_retries}) exceeded for iteration {n_iter + 1}. "
+                                    f"Skipping self-reflection for this iteration."
+                                )
+                                max_retries_exceeded += 1
+                                iteration_success = True
+                            continue
+                    else:
+                        # Self-reflection disabled, no quality control
+                        iteration_success = True
+
+                    # Only proceed with normal flow if iteration succeeded or max retries exceeded
+                    if not iteration_success and retry_count <= max_retries:
+                        continue
+
+                    # Decode structures
+                    decoded_x = model.decode_structure(generate_sample, mask)
+
+                    # Extract coordinates
+                    x_recon_xyz = None
+                    for decoder_name in decoded_x:
+                        if "vit_decoder" == decoder_name:
+                            x_recon_xyz = decoded_x[decoder_name]
+                            break
+
+                    if x_recon_xyz is None:
+                        raise RuntimeError("No structure decoder found in model output")
+
+                    # Extract sequences
+                    if generate_sample["sequence_logits"].shape[-1] == 33:
+                        seq = convert_lobster_aa_tokenization_to_standard_aa(
+                            generate_sample["sequence_logits"], device=device
+                        )
+                    else:
+                        seq = generate_sample["sequence_logits"].argmax(dim=-1)
+                        seq[seq > 21] = 20
+
+                    # Write sequences to CSV
+                    # Note: For self-reflection mode, we only store initial unconditional sequences (not forward/inverse intermediates)
+                    if csv_writer is not None:
+                        # Convert sequences to strings
+                        sequence_strs = []
+                        for i in range(batch_size):
+                            seq_i = seq[i, mask[i] == 1]
+                            sequence_str = "".join([restype_order_with_x_inv[j.item()] for j in seq_i])
+                            sequence_strs.append(sequence_str)
+
+                        # Write to sequences CSV
+                        csv_writer.write_sequences(
+                            sequences=sequence_strs,
+                            run_id=f"unconditional_length_{current_length}_iter_{n_iter:03d}",
+                            iteration=n_iter,
+                            sequence_type="unconditional",
+                        )
+
+                    # Save generated structures
+                    logger.info("Saving generated structures...")
+                    for i in range(batch_size):
+                        filename = (
+                            output_dir
+                            / f"generated_structure_length_{current_length}_{n_iter * batch_size + i:03d}.pdb"
+                        )
+                        writepdb(str(filename), x_recon_xyz[i], seq[i])
+                        logger.info(f"Saved: {filename}")
+
+                    # Optional ESMFold validation
+                    if plm_fold is not None:
+                        logger.info("Validating structures with ESMFold...")
+                        batch_metrics = _validate_with_esmfold(
+                            seq,
+                            x_recon_xyz,
+                            plm_fold,
+                            device,
+                            output_dir,
+                            f"generated_structure_length_{current_length}_{n_iter * batch_size + i:03d}",
+                            max_length=current_length,
+                        )
+
+                        # Log metrics for unconditional generation
+                        if batch_metrics:
+                            logger.info("ESMFold validation metrics for unconditional generation:")
+                            for key, value in batch_metrics.items():
+                                logger.info(f"  {key}: {value:.4f}")
+
+                            # Store metrics for CSV logging
+                            if csv_writer is not None:
+                                run_id = f"unconditional_length_{current_length}_iter_{n_iter:03d}"
+                                csv_writer.write_batch_metrics(
+                                    batch_metrics, run_id, sequence_length=current_length, num_samples=batch_size
+                                )
+
+                            # Always collect metrics for aggregate statistics
+                            all_metrics.append(batch_metrics)
 
         # Calculate and log aggregate statistics for this length
         if all_metrics:
             logger.info(f"Calculating aggregate statistics for length {current_length}...")
 
             # Collect all metric values
-            metric_lists = {"_plddt": [], "_predicted_aligned_error": [], "_tm_score": [], "_rmsd": []}
+            metric_lists = {
+                "_plddt": [],
+                "_predicted_aligned_error": [],
+                "_tm_score": [],
+                "_rmsd": [],
+                # Self-reflection refinement metrics
+                "percent_identity_self_reflection": [],
+                "tm_score_unconditional_to_forward": [],
+                "rmsd_unconditional_to_forward": [],
+                "tm_score_forward_to_inverse": [],
+                "rmsd_forward_to_inverse": [],
+                # ESMFold baseline metrics
+                "plddt_unconditional": [],
+                "pae_unconditional": [],
+                "tm_score_esmfold_unconditional": [],
+                "rmsd_esmfold_unconditional": [],
+                # ESMFold refined metrics
+                "plddt_refined": [],
+                "pae_refined": [],
+                "tm_score_esmfold_refined": [],
+                "rmsd_esmfold_refined": [],
+                # ESMFold improvement metrics
+                "plddt_improvement": [],
+                "pae_improvement": [],
+                "tm_score_improvement": [],
+                "rmsd_improvement": [],
+                # ESMFold structure comparison metrics
+                "tm_score_unconditional_to_esmfold": [],
+                "rmsd_unconditional_to_esmfold": [],
+                "tm_score_forward_to_esmfold": [],
+                "rmsd_forward_to_esmfold": [],
+                "tm_score_esmfold_agreement_improvement": [],
+                "rmsd_esmfold_agreement_improvement": [],
+            }
 
             for metrics in all_metrics:
                 for key in metric_lists:
@@ -707,7 +1105,30 @@ def _generate_unconditional(
                         metric_lists[key].append(metrics[key])
 
             # Calculate aggregate statistics
-            aggregate_stats = _calculate_aggregate_stats(metric_lists)
+            aggregate_stats = calculate_aggregate_stats(metric_lists)
+
+            # Calculate RMSD pass rates (< 2.0Å threshold)
+            rmsd_pass_rates = {}
+            rmsd_threshold = 2.0
+
+            # Check each RMSD metric in metric_lists
+            rmsd_metrics = [
+                "_rmsd",
+                "rmsd_unconditional_to_forward",
+                "rmsd_forward_to_inverse",
+                "rmsd_esmfold_unconditional",
+                "rmsd_esmfold_refined",
+                "rmsd_unconditional_to_esmfold",
+                "rmsd_forward_to_esmfold",
+            ]
+
+            for rmsd_metric in rmsd_metrics:
+                if rmsd_metric in metric_lists and metric_lists[rmsd_metric]:
+                    rmsd_values = metric_lists[rmsd_metric]
+                    total_count = len(rmsd_values)
+                    pass_count = sum(1 for rmsd in rmsd_values if rmsd < rmsd_threshold)
+                    pass_rate = (pass_count / total_count * 100) if total_count > 0 else 0.0
+                    rmsd_pass_rates[rmsd_metric] = (pass_count, total_count, pass_rate)
 
             # Log aggregate statistics
             logger.info("=" * 80)
@@ -717,11 +1138,83 @@ def _generate_unconditional(
             for metric_name, (avg_value, count) in aggregate_stats.items():
                 logger.info(f"Average {metric_name}: {avg_value:.4f} (n={count})")
 
+            # Log RMSD pass rates
+            if rmsd_pass_rates:
+                logger.info("")
+                logger.info(f"RMSD Pass Rates (< {rmsd_threshold:.1f}Å):")
+                for rmsd_metric, (pass_count, total_count, pass_rate) in rmsd_pass_rates.items():
+                    logger.info(f"  {rmsd_metric}: {pass_count}/{total_count} ({pass_rate:.1f}%)")
+
             logger.info("=" * 80)
+
+            # Log quality control statistics if enabled
+            if max_retries > 0 and gen_cfg.get("enable_self_reflection", False):
+                logger.info("")
+                logger.info("SELF-REFLECTION QUALITY CONTROL SUMMARY")
+                logger.info("=" * 80)
+                logger.info(f"Total iterations: {n_iterations}")
+                logger.info(f"Retries required: {total_retries}")
+                logger.info(f"Max retries exceeded: {max_retries_exceeded}")
+                if "tm_score_unconditional_to_forward" in metric_lists:
+                    forward_tm_scores = metric_lists["tm_score_unconditional_to_forward"]
+                    if forward_tm_scores:
+                        avg_forward_tm = sum(forward_tm_scores) / len(forward_tm_scores)
+                        logger.info(f"Average forward TM-score: {avg_forward_tm:.3f}")
+                if "percent_identity_self_reflection" in metric_lists:
+                    percent_identities = metric_lists["percent_identity_self_reflection"]
+                    if percent_identities:
+                        avg_percent_id = sum(percent_identities) / len(percent_identities)
+                        logger.info(f"Average percent identity: {avg_percent_id:.2f}%")
+            logger.info("=" * 80)
+
+            # Foldseek Diversity Analysis
+            if cfg.generation.get("calculate_foldseek_diversity", False):
+                logger.info("")
+                logger.info("FOLDSEEK DIVERSITY ANALYSIS")
+                logger.info("=" * 80)
+
+                foldseek_bin_path = cfg.generation.get(
+                    "foldseek_bin_path",
+                    "/homefs/home/lisanzas/scratch/Develop/lobster/src/lobster/metrics/foldseek/bin",
+                )
+
+                try:
+                    diversity_metrics = calculate_diversity_for_generation(
+                        output_dir=output_dir,
+                        length=current_length,
+                        rmsd_threshold=cfg.generation.get("rmsd_threshold_for_diversity", 2.0),
+                        foldseek_bin_path=foldseek_bin_path,
+                        tmscore_threshold=cfg.generation.get("foldseek_tmscore_threshold", 0.5),
+                    )
+
+                    if diversity_metrics:
+                        logger.info(f"Total structures passing RMSD threshold: {diversity_metrics['total_structures']}")
+                        logger.info(
+                            f"Number of Foldseek clusters (TM-score ≥ {diversity_metrics['tmscore_threshold']}): {diversity_metrics['num_clusters']}"
+                        )
+                        logger.info(f"Diversity percentage: {diversity_metrics['diversity_percentage']:.2f}%")
+
+                        # Write to CSV if available
+                        if csv_writer is not None:
+                            csv_writer.write_diversity_metrics(
+                                diversity_metrics=diversity_metrics, length=current_length
+                            )
+
+                except Exception as e:
+                    logger.error(f"Foldseek diversity analysis failed: {e}")
+                    import traceback
+
+                    traceback.print_exc()
+
+                logger.info("=" * 80)
 
             # Write aggregate statistics to CSV if writer is available
             if csv_writer is not None:
                 csv_writer.write_aggregate_stats(aggregate_stats, length=current_length)
+
+                # Write pass rate statistics to CSV if available
+                if rmsd_pass_rates:
+                    csv_writer.write_pass_rates(rmsd_pass_rates, length=current_length, threshold=rmsd_threshold)
 
     # Create plots from CSV data if plotter is available
     if plotter is not None and csv_writer is not None:
@@ -730,7 +1223,15 @@ def _generate_unconditional(
             plotter.create_box_plots_from_csv(csv_writer.csv_path)
             logger.info("✓ Box plots created successfully")
         except Exception as e:
-            logger.error(f"Error creating plots: {e}")
+            logger.error(f"Error creating box plots: {e}")
+
+        # Create correlation plots (only for self-reflection enabled runs)
+        logger.info("Creating correlation plots from CSV data...")
+        try:
+            plotter.create_correlation_plots_from_csv(csv_writer.csv_path)
+            logger.info("✓ Correlation plots created successfully")
+        except Exception as e:
+            logger.error(f"Error creating correlation plots: {e}")
 
 
 def _generate_inverse_folding(
@@ -783,8 +1284,10 @@ def _generate_inverse_folding(
     nsteps = gen_cfg.get("nsteps", 100)
     batch_size = gen_cfg.get("batch_size", 1)
     n_trials = gen_cfg.get("n_trials", 1)  # Number of trials for best output selection
+    n_designs_per_structure = gen_cfg.get("n_designs_per_structure", 1)  # Number of designs to generate per structure
 
     logger.info(f"Processing structures with {nsteps} generation steps, batch size {batch_size}, n_trials {n_trials}")
+    logger.info(f"Generating {n_designs_per_structure} sequence design(s) per structure")
 
     # Initialize StructureBackboneTransform
     structure_transform = StructureBackboneTransform(max_length=cfg.generation.get("max_length", 512))
@@ -886,269 +1389,433 @@ def _generate_inverse_folding(
 
             logger.info(f"Batch {batch_idx + 1}: {B} structures, max length {max_length}")
 
-            # Run multiple trials and select best based on TM-score
-            best_trial_results = []
+            # Loop over designs - generate multiple independent designs per structure
+            for design_idx in range(n_designs_per_structure):
+                if n_designs_per_structure > 1:
+                    logger.info("=" * 60)
+                    logger.info(f"DESIGN {design_idx + 1}/{n_designs_per_structure} for batch {batch_idx + 1}")
+                    logger.info("=" * 60)
 
-            for trial in range(n_trials):
-                logger.info(f"Trial {trial + 1}/{n_trials} for batch {batch_idx + 1}")
+                # Run multiple trials and select best based on TM-score
+                best_trial_results = []
 
-                # Generate sequences
-                generate_sample = model.generate_sample(
-                    length=max_length,
-                    num_samples=B,
-                    inverse_folding=True,
-                    nsteps=nsteps,
-                    input_structure_coords=coords_res,
-                    input_mask=mask,
-                    input_indices=indices,
-                    temperature_seq=gen_cfg.get("temperature_seq", 0.5),
-                    stochasticity_seq=gen_cfg.get("stochasticity_seq", 20),
-                )
-
-                # Decode structures
-                decoded_x = model.decode_structure(generate_sample, mask)
-
-                # Extract coordinates
-                x_recon_xyz = None
-                for decoder_name in decoded_x:
-                    if "vit_decoder" == decoder_name:
-                        x_recon_xyz = decoded_x[decoder_name]
-                        break
-
-                # Extract sequences
-                if generate_sample["sequence_logits"].shape[-1] == 33:
-                    seq = convert_lobster_aa_tokenization_to_standard_aa(
-                        generate_sample["sequence_logits"], device=device
-                    )
-                else:
-                    seq = generate_sample["sequence_logits"].argmax(dim=-1)
-                    seq[seq > 21] = 20
-
-                # Calculate TM-scores for this trial
-                trial_tm_scores = []
-                outputs = None
-                pred_coords = None
-                trial_folded_structure_metrics = None
-
-                for i in range(B):
-                    # Get original coordinates
-                    orig_coords = coords_res[i, mask[i] == 1, :, :]  # Original structure
-
-                    # Get generated sequence
-                    seq_i = seq[i, mask[i] == 1]
-
-                    # Get chain information for this structure
-                    chains_i = filtered_batch_data[i]["chains"].to(device)[mask[i] == 1]
-
-                    # Build sequence string with chain breaks
-                    sequence_str = ""
-                    prev_chain = None
-                    for j, (aa_idx, chain_id) in enumerate(zip(seq_i, chains_i)):
-                        if prev_chain is not None and chain_id.item() != prev_chain:
-                            sequence_str += ":"
-                        sequence_str += restype_order_with_x_inv[aa_idx.item()]
-                        prev_chain = chain_id.item()
-
-                    sequence_str, position_ids, linker_mask = add_linker_to_sequence(sequence_str)
-
-                    # For inverse folding, we need to fold the generated sequence with ESMFold
-                    # and compare with the original structure
-                    if plm_fold is not None:
-                        # Tokenize the generated sequence
-                        tokenized_input = plm_fold.tokenizer.encode_plus(
-                            sequence_str,
-                            padding=True,
-                            truncation=True,
-                            max_length=cfg.generation.get("max_length", 512),
-                            add_special_tokens=False,
-                            return_tensors="pt",
-                        )["input_ids"].to(device)
-
-                        # Fold with ESMFold
-                        with torch.no_grad():
-                            # outputs = plm_fold.model(tokenized_input)
-                            outputs = plm_fold.model(tokenized_input, position_ids=position_ids.unsqueeze(0).to(device))
-                        # remove linker from outputs using linker_mask
-                        outputs["positions"] = outputs["positions"][:, :, linker_mask == 1, :, :]
-                        outputs["plddt"] = outputs["plddt"][:, linker_mask == 1]
-                        outputs["predicted_aligned_error"] = outputs["predicted_aligned_error"][:, linker_mask == 1]
-                        # use linker_mask to remove linker from sequence_str
-                        sequence_list = list(sequence_str)
-                        sequence_str = "".join(
-                            [seq_char for seq_char, mask_val in zip(sequence_list, linker_mask) if mask_val == 1]
-                        )
-
-                        # Get folded structure coordinates
-                        folded_structure_metrics, pred_coords = get_folded_structure_metrics(
-                            outputs, orig_coords[None], [sequence_str], mask=mask[i : i + 1]
-                        )
-
-                        trial_tm_scores.append(folded_structure_metrics["_tm_score"])
-                        trial_folded_structure_metrics = folded_structure_metrics  # Store for reuse
-                        logger.info(f"TM-score: {folded_structure_metrics['_tm_score']:.3f}")
-
-                    else:
-                        # If ESMFold is not available, use generated structure as fallback
-                        gen_coords = x_recon_xyz[i, mask[i] == 1, :, :]  # Generated structure
-                        tm_out = tm_align(
-                            gen_coords[:, 1, :].cpu().numpy(),  # CA atoms of generated structure
-                            orig_coords[:, 1, :].detach().cpu().numpy(),  # CA atoms of original structure
-                            sequence_str,
-                            sequence_str,
-                        )
-                        trial_tm_scores.append(tm_out.tm_norm_chain1)
-
-                # Store trial results
-                best_trial_results.append(
-                    {
-                        "trial": trial,
-                        "tm_scores": trial_tm_scores,
-                        "avg_tm_score": sum(trial_tm_scores) / len(trial_tm_scores),
-                        "generate_sample": generate_sample,
-                        "x_recon_xyz": x_recon_xyz,
-                        "seq": seq,
-                        "esmfold_outputs": outputs,
-                        "esmfold_pred_coords": pred_coords,
-                        "folded_structure_metrics": trial_folded_structure_metrics,
-                    }
-                )
-
-            # Select best trial based on average TM-score
-            best_trial = max(best_trial_results, key=lambda x: x["avg_tm_score"])
-            logger.info(
-                f"Selected trial {best_trial['trial'] + 1} with average TM-score: {best_trial['avg_tm_score']:.3f}"
-            )
-
-            # Use best trial results
-            generate_sample = best_trial["generate_sample"]
-            x_recon_xyz = best_trial["x_recon_xyz"]
-            seq = best_trial["seq"]
-
-            # Calculate percent identity for inverse folding (compare generated sequence with original)
-            # For inverse folding, we need to get the original sequence from the input structure
-            original_sequences = []
-            for i, valid_idx in enumerate(filtered_valid_indices):
-                structure_path = batch_paths[valid_idx]
-                if structure_path.endswith(".pt"):
-                    # For .pt files, the sequence should be in the loaded data
-                    structure_data = torch.load(structure_path, map_location="cpu")
-                    if "sequence" in structure_data:
-                        orig_seq = structure_data["sequence"]
-                        if orig_seq.dim() > 1:
-                            orig_seq = orig_seq.squeeze()
-                        original_sequences.append(orig_seq)
-                    else:
-                        raise ValueError(f"No sequence found for structure: {structure_path}")
-                else:
-                    # For PDB/CIF files, we need to extract sequence from the loaded structure
-                    # This is already done in the structure_transform, so we can get it from batch_data
-                    if i < len(batch_data) and "sequence" in batch_data[i]:
-                        orig_seq = batch_data[i]["sequence"]
-                        if orig_seq.dim() > 1:
-                            orig_seq = orig_seq.squeeze()
-                        original_sequences.append(orig_seq)
-                    else:
-                        raise ValueError(f"No sequence found for structure: {structure_path}")
-
-            # Calculate percent identity for this batch
-            if original_sequences:
-                batch_percent_identities = []
-
-                for i, (orig_seq, gen_seq) in enumerate(zip(original_sequences, seq)):
-                    # Get the actual length of the original sequence (excluding padding)
-                    orig_len = len(orig_seq)
-                    gen_len = len(gen_seq)
-
-                    # Use the minimum length to avoid dimension mismatches
-                    min_len = min(orig_len, gen_len)
-
-                    if min_len > 0:
-                        # Truncate both sequences to the same length and ensure they're on the same device
-                        orig_seq_truncated = orig_seq[:min_len].to(device)
-                        gen_seq_truncated = gen_seq[:min_len].to(device)
-
-                        # Calculate percent identity for this single sequence
-                        percent_identity = calculate_percent_identity(
-                            orig_seq_truncated.unsqueeze(0), gen_seq_truncated.unsqueeze(0)
-                        )
-                        batch_percent_identities.append(percent_identity.item())
-                    else:
-                        # If sequences are empty, set percent identity to 0
-                        batch_percent_identities.append(0.0)
-
-                all_percent_identities.extend(batch_percent_identities)
-
-            # Save results
-            logger.info(f"Saving inverse folding results for batch {batch_idx + 1}...")
-            for i, valid_idx in enumerate(filtered_valid_indices):
-                original_path = batch_paths[valid_idx]
-                original_name = Path(original_path).stem
-                x_recon_xyz_i_masked = x_recon_xyz[i, mask[i] == 1]
-                seq_i_masked = seq[i, mask[i] == 1]
-
-                # Save generated structure
-                filename = output_dir / f"inverse_folding_{original_name}_generated.pdb"
-                writepdb(str(filename), x_recon_xyz_i_masked, seq_i_masked)
-                logger.info(f"Saved: {filename}")
-
-            # Optional ESMFold validation - reuse results from trial selection
-            if plm_fold is not None:
-                logger.info(f"Validating batch {batch_idx + 1} with ESMFold (reusing trial results)...")
-
-                # Reuse ESMFold results from the best trial
-                if best_trial["folded_structure_metrics"] is not None and best_trial["esmfold_pred_coords"] is not None:
-                    # Use stored metrics without recalculation
-                    folded_structure_metrics = best_trial["folded_structure_metrics"]
-                    pred_coords = best_trial["esmfold_pred_coords"]
-
-                    # Log metrics
-                    logger.info("ESMFold validation metrics:")
-                    for key, value in folded_structure_metrics.items():
-                        logger.info(f"  {key}: {value:.4f}")
-
-                    # Save folded structures
-                    for i in range(seq.shape[0]):
-                        original_name = Path(batch_paths[filtered_valid_indices[i]]).stem
-                        filename = output_dir / f"inverse_folding_{original_name}_esmfold.pdb"
-                        pred_coords_i_masked = pred_coords[i, mask[i] == 1]
-                        seq_i_masked = seq[i, mask[i] == 1]
-                        writepdb(str(filename), pred_coords_i_masked, seq_i_masked)
-                        logger.info(f"Saved ESMFold structure: {filename}")
-
-                    batch_metrics = folded_structure_metrics
-                else:
-                    # Fallback to original validation if no stored results
-                    logger.warning("No stored ESMFold results, running validation...")
-                    batch_metrics = _validate_with_esmfold(
-                        seq,
-                        x_recon_xyz,
-                        plm_fold,
-                        device,
-                        output_dir,
-                        f"inverse_folding_batch{batch_idx:03d}",
-                        original_paths=[batch_paths[i] for i in filtered_valid_indices],
-                        mask=mask,
-                        max_length=max_length,
+                for trial in range(n_trials):
+                    logger.info(
+                        f"Trial {trial + 1}/{n_trials} for batch {batch_idx + 1}, design {design_idx + 1}/{n_designs_per_structure}"
                     )
 
-                # Collect metrics for aggregate statistics
-                if batch_metrics:
-                    all_plddt_scores.append(batch_metrics["_plddt"])
-                    all_predicted_aligned_errors.append(batch_metrics["_predicted_aligned_error"])
-                    all_tm_scores.append(batch_metrics["_tm_score"])
-                    all_rmsd_scores.append(batch_metrics["_rmsd"])
-                    avg_percent_identity = sum(batch_percent_identities) / len(batch_percent_identities)
+                    # Generate sequences
+                    generate_sample = model.generate_sample(
+                        length=max_length,
+                        num_samples=B,
+                        inverse_folding=True,
+                        nsteps=nsteps,
+                        input_structure_coords=coords_res,
+                        input_mask=mask,
+                        input_indices=indices,
+                        temperature_seq=gen_cfg.get("temperature_seq", 0.5),
+                        stochasticity_seq=gen_cfg.get("stochasticity_seq", 20),
+                        asynchronous_sampling=gen_cfg.get("asynchronous_sampling", False),
+                    )
 
-                    # Write batch metrics to CSV
-                    if csv_writer is not None:
+                    # Decode structures
+                    decoded_x = model.decode_structure(generate_sample, mask)
+
+                    # Extract coordinates
+                    x_recon_xyz = None
+                    for decoder_name in decoded_x:
+                        if "vit_decoder" == decoder_name:
+                            x_recon_xyz = decoded_x[decoder_name]
+                            break
+
+                    # Extract sequences
+                    if generate_sample["sequence_logits"].shape[-1] == 33:
+                        seq = convert_lobster_aa_tokenization_to_standard_aa(
+                            generate_sample["sequence_logits"], device=device
+                        )
+                    else:
+                        seq = generate_sample["sequence_logits"].argmax(dim=-1)
+                        seq[seq > 21] = 20
+
+                    # Calculate TM-scores for this trial
+                    trial_tm_scores = []
+                    outputs = None
+                    pred_coords = None
+                    trial_folded_structure_metrics = None
+
+                    for i in range(B):
+                        # Get original coordinates
+                        orig_coords = coords_res[i, mask[i] == 1, :, :]  # Original structure
+
+                        # Get generated sequence
+                        seq_i = seq[i, mask[i] == 1]
+
+                        # Get chain information for this structure
+                        chains_i = filtered_batch_data[i]["chains"].to(device)[mask[i] == 1]
+
+                        # For inverse folding, we need to fold the generated sequence with ESMFold
+                        # and compare with the original structure
+                        if plm_fold is not None:
+                            # Parse chain groups from config
+                            esmfold_chain_groups = cfg.generation.get("esmfold_chain_groups", None)
+
+                            # If not specified, use all chains (default behavior for backwards compatibility)
+                            if esmfold_chain_groups is None:
+                                unique_chains = chains_i.unique().tolist()
+                                esmfold_chain_groups = [unique_chains]
+
+                            # Log available chains for debugging
+                            available_chains = chains_i.unique().tolist()
+                            logger.info(f"Available chains in structure: {available_chains}")
+                            logger.info(
+                                f"Predicting {len(esmfold_chain_groups)} chain group(s): {esmfold_chain_groups}"
+                            )
+
+                            # Run ESMFold prediction for each chain group
+                            chain_group_results = []
+                            for group_idx, chain_group in enumerate(esmfold_chain_groups):
+                                logger.info(
+                                    f"ESMFold prediction for chain group {group_idx + 1}/{len(esmfold_chain_groups)}: "
+                                    f"{chain_group}"
+                                )
+
+                                # Validate chain group
+                                invalid_chains = [c for c in chain_group if c not in available_chains]
+                                if invalid_chains:
+                                    logger.warning(
+                                        f"Chain group {chain_group} contains invalid chain IDs: {invalid_chains}. "
+                                        f"Available chains: {available_chains}. Skipping this group."
+                                    )
+                                    continue
+
+                                if not chain_group:
+                                    logger.warning("Empty chain group specified, skipping")
+                                    continue
+
+                                # Use refactored ESMFold prediction function
+                                result = predict_structure_with_esmfold(
+                                    plm_fold=plm_fold,
+                                    seq_i=seq_i,
+                                    chains_i=chains_i,
+                                    orig_coords=orig_coords,
+                                    gen_coords=None,  # No generated coords for inverse folding
+                                    mask_i=mask[i],
+                                    cfg=cfg,
+                                    device=device,
+                                    restype_order_inv=restype_order_with_x_inv,
+                                    chain_group=chain_group,  # Specify which chains to predict
+                                )
+
+                                chain_group_results.append(result)
+
+                                logger.info(
+                                    f"Chain group {chain_group}: TM-score: "
+                                    f"{result['folded_structure_metrics']['_tm_score']:.3f}, "
+                                    f"Chains: {result['num_chains']}, Residues: {result['num_residues']}"
+                                )
+
+                            # Handle results: use first group as primary, store all
+                            if chain_group_results:
+                                # Use FIRST chain group as primary result (user controls priority by ordering)
+                                primary_result = chain_group_results[0]
+
+                                logger.info(
+                                    f"Using first chain group {primary_result['chain_group']} as primary result: "
+                                    f"TM-score {primary_result['folded_structure_metrics']['_tm_score']:.3f}"
+                                )
+
+                                # Log all other results for comparison
+                                if len(chain_group_results) > 1:
+                                    logger.info("Additional chain group results:")
+                                    for idx, result in enumerate(chain_group_results[1:], start=2):
+                                        logger.info(
+                                            f"  Chain group {idx}/{len(chain_group_results)} {result['chain_group']}: "
+                                            f"TM-score {result['folded_structure_metrics']['_tm_score']:.3f}, "
+                                            f"Chains: {result['num_chains']}, Residues: {result['num_residues']}"
+                                        )
+
+                                # Use primary result for output
+                                trial_tm_scores.append(primary_result["folded_structure_metrics"]["_tm_score"])
+                                outputs = primary_result["esmfold_outputs"]
+                                pred_coords = primary_result["pred_coords"]
+                                trial_folded_structure_metrics = primary_result["folded_structure_metrics"]
+
+                                # Store ALL results for later analysis
+                                trial_folded_structure_metrics["_all_chain_group_results"] = chain_group_results
+                                trial_folded_structure_metrics["_primary_chain_group"] = primary_result["chain_group"]
+                            else:
+                                # Fallback: if all chain groups invalid, use all chains
+                                logger.warning("No valid chain groups found, falling back to all chains")
+                                result = predict_structure_with_esmfold(
+                                    plm_fold=plm_fold,
+                                    seq_i=seq_i,
+                                    chains_i=chains_i,
+                                    orig_coords=orig_coords,
+                                    gen_coords=None,
+                                    mask_i=mask[i],
+                                    cfg=cfg,
+                                    device=device,
+                                    restype_order_inv=restype_order_with_x_inv,
+                                )
+
+                                trial_tm_scores.append(result["folded_structure_metrics"]["_tm_score"])
+                                outputs = result["esmfold_outputs"]
+                                pred_coords = result["pred_coords"]
+                                trial_folded_structure_metrics = result["folded_structure_metrics"]
+
+                                logger.info(f"TM-score: {result['folded_structure_metrics']['_tm_score']:.3f}")
+
+                        else:
+                            # If ESMFold is not available, use generated structure as fallback
+                            # Build sequence string for TM-align
+                            sequence_str = build_multichain_sequence_string(seq_i, chains_i, restype_order_with_x_inv)
+
+                            gen_coords = x_recon_xyz[i, mask[i] == 1, :, :]  # Generated structure
+                            tm_out = tm_align(
+                                gen_coords[:, 1, :].cpu().numpy(),  # CA atoms of generated structure
+                                orig_coords[:, 1, :].detach().cpu().numpy(),  # CA atoms of original structure
+                                sequence_str,
+                                sequence_str,
+                            )
+                            trial_tm_scores.append(tm_out.tm_norm_chain1)
+
+                    # Store trial results
+                    best_trial_results.append(
+                        {
+                            "trial": trial,
+                            "tm_scores": trial_tm_scores,
+                            "avg_tm_score": sum(trial_tm_scores) / len(trial_tm_scores),
+                            "generate_sample": generate_sample,
+                            "x_recon_xyz": x_recon_xyz,
+                            "seq": seq,
+                            "esmfold_outputs": outputs,
+                            "esmfold_pred_coords": pred_coords,
+                            "folded_structure_metrics": trial_folded_structure_metrics,
+                        }
+                    )
+
+                # Select best trial based on average TM-score
+                best_trial = max(best_trial_results, key=lambda x: x["avg_tm_score"])
+                logger.info(
+                    f"Selected trial {best_trial['trial'] + 1} with average TM-score: {best_trial['avg_tm_score']:.3f}"
+                )
+
+                # Use best trial results
+                generate_sample = best_trial["generate_sample"]
+                x_recon_xyz = best_trial["x_recon_xyz"]
+                seq = best_trial["seq"]
+
+                # Calculate percent identity for inverse folding (compare generated sequence with original)
+                # For inverse folding, we need to get the original sequence from the input structure
+                original_sequences = []
+                for i, valid_idx in enumerate(filtered_valid_indices):
+                    structure_path = batch_paths[valid_idx]
+                    if structure_path.endswith(".pt"):
+                        # For .pt files, the sequence should be in the loaded data
+                        structure_data = torch.load(structure_path, map_location="cpu")
+                        if "sequence" in structure_data:
+                            orig_seq = structure_data["sequence"]
+                            if orig_seq.dim() > 1:
+                                orig_seq = orig_seq.squeeze()
+                            original_sequences.append(orig_seq)
+                        else:
+                            raise ValueError(f"No sequence found for structure: {structure_path}")
+                    else:
+                        # For PDB/CIF files, we need to extract sequence from the loaded structure
+                        # This is already done in the structure_transform, so we can get it from batch_data
+                        if i < len(batch_data) and "sequence" in batch_data[i]:
+                            orig_seq = batch_data[i]["sequence"]
+                            if orig_seq.dim() > 1:
+                                orig_seq = orig_seq.squeeze()
+                            original_sequences.append(orig_seq)
+                        else:
+                            raise ValueError(f"No sequence found for structure: {structure_path}")
+
+                # Calculate percent identity for this batch
+                if original_sequences:
+                    batch_percent_identities = []
+
+                    for i, (orig_seq, gen_seq) in enumerate(zip(original_sequences, seq)):
+                        # Get the actual length of the original sequence (excluding padding)
+                        orig_len = len(orig_seq)
+                        gen_len = len(gen_seq)
+
+                        # Use the minimum length to avoid dimension mismatches
+                        min_len = min(orig_len, gen_len)
+
+                        if min_len > 0:
+                            # Truncate both sequences to the same length and ensure they're on the same device
+                            orig_seq_truncated = orig_seq[:min_len].to(device)
+                            gen_seq_truncated = gen_seq[:min_len].to(device)
+
+                            # Calculate percent identity for this single sequence
+                            percent_identity = calculate_percent_identity(
+                                orig_seq_truncated.unsqueeze(0), gen_seq_truncated.unsqueeze(0)
+                            )
+                            batch_percent_identities.append(percent_identity.item())
+                        else:
+                            # If sequences are empty, set percent identity to 0
+                            batch_percent_identities.append(0.0)
+
+                    all_percent_identities.extend(batch_percent_identities)
+
+                # Write sequences to CSV
+                if csv_writer is not None:
+                    # Convert generated sequences to strings
+                    generated_sequence_strs = []
+                    for i in range(B):
+                        seq_i = seq[i, mask[i] == 1]
+                        sequence_str = "".join([restype_order_with_x_inv[j.item()] for j in seq_i])
+                        generated_sequence_strs.append(sequence_str)
+
+                    # Convert original sequences to strings
+                    original_sequence_strs = []
+                    for orig_seq in original_sequences:
+                        orig_seq_str = "".join([restype_order_with_x_inv[j.item()] for j in orig_seq])
+                        original_sequence_strs.append(orig_seq_str)
+
+                    # Determine run_id based on whether we're generating multiple designs
+                    if n_designs_per_structure > 1:
+                        run_id = f"inverse_folding_batch_{batch_idx:03d}_design_{design_idx:02d}"
+                    else:
                         run_id = f"inverse_folding_batch_{batch_idx:03d}"
-                        csv_writer.write_batch_metrics(
-                            batch_metrics,
-                            run_id,
-                            percent_identity=avg_percent_identity,
-                            sequence_length=max_length,
-                            input_file=f"batch_{batch_idx:03d}",
+
+                    # Write to sequences CSV
+                    csv_writer.write_sequences(
+                        sequences=generated_sequence_strs,
+                        original_sequences=original_sequence_strs,
+                        run_id=run_id,
+                        input_structure=[Path(batch_paths[i]).stem for i in filtered_valid_indices],
+                        trial_number=best_trial["trial"] + 1,
+                        percent_identities=batch_percent_identities,
+                    )
+
+                # Save results
+                logger.info(f"Saving inverse folding results for batch {batch_idx + 1}, design {design_idx + 1}...")
+                for i, valid_idx in enumerate(filtered_valid_indices):
+                    original_path = batch_paths[valid_idx]
+                    original_name = Path(original_path).stem
+                    x_recon_xyz_i_masked = x_recon_xyz[i, mask[i] == 1]
+                    seq_i_masked = seq[i, mask[i] == 1]
+
+                    # Save generated structure with design index
+                    if n_designs_per_structure > 1:
+                        filename = output_dir / f"inverse_folding_{original_name}_design_{design_idx:02d}_generated.pdb"
+                    else:
+                        filename = output_dir / f"inverse_folding_{original_name}_generated.pdb"
+                    writepdb(str(filename), x_recon_xyz_i_masked, seq_i_masked)
+                    logger.info(f"Saved: {filename}")
+
+                # Optional ESMFold validation - reuse results from trial selection
+                if plm_fold is not None:
+                    logger.info(f"Validating batch {batch_idx + 1} with ESMFold (reusing trial results)...")
+
+                    # Reuse ESMFold results from the best trial
+                    if (
+                        best_trial["folded_structure_metrics"] is not None
+                        and best_trial["esmfold_pred_coords"] is not None
+                    ):
+                        # Use stored metrics without recalculation
+                        folded_structure_metrics = best_trial["folded_structure_metrics"]
+                        pred_coords = best_trial["esmfold_pred_coords"]
+
+                        # Log metrics
+                        logger.info("ESMFold validation metrics:")
+                        for key, value in folded_structure_metrics.items():
+                            # Skip internal fields that store chain group results
+                            if key.startswith("_all_") or key.startswith("_primary_"):
+                                continue
+                            # Format numeric values
+                            if isinstance(value, (int, float)):
+                                logger.info(f"  {key}: {value:.4f}")
+                            else:
+                                logger.info(f"  {key}: {value}")
+
+                        # Save folded structures
+                        for i in range(seq.shape[0]):
+                            original_name = Path(batch_paths[filtered_valid_indices[i]]).stem
+
+                            # Check if using chain groups (pred_coords is filtered)
+                            if "_primary_chain_group" in folded_structure_metrics:
+                                # pred_coords only contains the filtered chains
+                                # No need to mask - already filtered
+                                pred_coords_i = pred_coords[i]
+
+                                # Get the filtered sequence (from filtered chains)
+                                chains_i = filtered_batch_data[i]["chains"].to(device)[mask[i] == 1]
+                                seq_i_full = seq[i, mask[i] == 1]
+
+                                # Create mask for primary chain group
+                                primary_chain_group = folded_structure_metrics["_primary_chain_group"]
+                                chain_mask = torch.zeros_like(chains_i, dtype=torch.bool)
+                                for chain_id in primary_chain_group:
+                                    chain_mask |= chains_i == chain_id
+
+                                seq_i_filtered = seq_i_full[chain_mask]
+
+                                if n_designs_per_structure > 1:
+                                    filename = (
+                                        output_dir
+                                        / f"inverse_folding_{original_name}_design_{design_idx:02d}_esmfold_chains_{'_'.join(map(str, primary_chain_group))}.pdb"
+                                    )
+                                else:
+                                    filename = (
+                                        output_dir
+                                        / f"inverse_folding_{original_name}_esmfold_chains_{'_'.join(map(str, primary_chain_group))}.pdb"
+                                    )
+                                writepdb(str(filename), pred_coords_i, seq_i_filtered)
+                                logger.info(f"Saved ESMFold structure (chains {primary_chain_group}): {filename}")
+                            else:
+                                # Using all chains - normal masking
+                                pred_coords_i_masked = pred_coords[i, mask[i] == 1]
+                                seq_i_masked = seq[i, mask[i] == 1]
+                                if n_designs_per_structure > 1:
+                                    filename = (
+                                        output_dir
+                                        / f"inverse_folding_{original_name}_design_{design_idx:02d}_esmfold.pdb"
+                                    )
+                                else:
+                                    filename = output_dir / f"inverse_folding_{original_name}_esmfold.pdb"
+                                writepdb(str(filename), pred_coords_i_masked, seq_i_masked)
+                                logger.info(f"Saved ESMFold structure: {filename}")
+
+                        batch_metrics = folded_structure_metrics
+                    else:
+                        # Fallback to original validation if no stored results
+                        logger.warning("No stored ESMFold results, running validation...")
+                        batch_metrics = _validate_with_esmfold(
+                            seq,
+                            x_recon_xyz,
+                            plm_fold,
+                            device,
+                            output_dir,
+                            f"inverse_folding_batch{batch_idx:03d}",
+                            original_paths=[batch_paths[i] for i in filtered_valid_indices],
+                            mask=mask,
+                            max_length=max_length,
                         )
+
+                    # Collect metrics for aggregate statistics
+                    if batch_metrics:
+                        all_plddt_scores.append(batch_metrics["_plddt"])
+                        all_predicted_aligned_errors.append(batch_metrics["_predicted_aligned_error"])
+                        all_tm_scores.append(batch_metrics["_tm_score"])
+                        all_rmsd_scores.append(batch_metrics["_rmsd"])
+                        avg_percent_identity = sum(batch_percent_identities) / len(batch_percent_identities)
+
+                        # Write batch metrics to CSV
+                        if csv_writer is not None:
+                            if n_designs_per_structure > 1:
+                                run_id = f"inverse_folding_batch_{batch_idx:03d}_design_{design_idx:02d}"
+                            else:
+                                run_id = f"inverse_folding_batch_{batch_idx:03d}"
+                            csv_writer.write_batch_metrics(
+                                batch_metrics,
+                                run_id,
+                                percent_identity=avg_percent_identity,
+                                sequence_length=max_length,
+                                input_file=f"batch_{batch_idx:03d}",
+                            )
 
     # Calculate and report aggregate statistics
     logger.info("=" * 80)
@@ -1179,9 +1846,19 @@ def _generate_inverse_folding(
     else:
         logger.warning("No TM-Score data collected")
 
+    # Calculate RMSD pass rate (< 2.0Å threshold)
+    rmsd_threshold = 2.0
+    rmsd_pass_rates = {}
+
     if all_rmsd_scores:
         avg_rmsd = sum(all_rmsd_scores) / len(all_rmsd_scores)
         logger.info(f"Average RMSD: {avg_rmsd:.2f} Å (n={len(all_rmsd_scores)})")
+
+        pass_count = sum(1 for rmsd in all_rmsd_scores if rmsd < rmsd_threshold)
+        total_count = len(all_rmsd_scores)
+        pass_rate = (pass_count / total_count * 100) if total_count > 0 else 0.0
+        rmsd_pass_rates["rmsd"] = (pass_count, total_count, pass_rate)
+        logger.info(f"RMSD Pass Rate (< {rmsd_threshold:.1f}Å): {pass_count}/{total_count} ({pass_rate:.1f}%)")
     else:
         logger.warning("No RMSD data collected")
 
@@ -1201,10 +1878,14 @@ def _generate_inverse_folding(
         }
 
         # Calculate aggregate statistics
-        aggregate_stats = _calculate_aggregate_stats(metric_lists)
+        aggregate_stats = calculate_aggregate_stats(metric_lists)
 
         # Write aggregate statistics to CSV
         csv_writer.write_aggregate_stats(aggregate_stats)
+
+        # Write pass rate statistics to CSV if available
+        if rmsd_pass_rates:
+            csv_writer.write_pass_rates(rmsd_pass_rates, threshold=rmsd_threshold)
 
     # Create plots from CSV data if plotter is available
     if plotter is not None and csv_writer is not None:
@@ -1213,7 +1894,13 @@ def _generate_inverse_folding(
             plotter.create_box_plots_from_csv(csv_writer.csv_path)
             logger.info("✓ Box plots created successfully")
         except Exception as e:
-            logger.error(f"Error creating plots: {e}")
+            logger.error(f"Error creating box plots: {e}")
+
+        # Create correlation plots (only for unconditional mode)
+        try:
+            plotter.create_correlation_plots_from_csv(csv_writer.csv_path)
+        except Exception as e:
+            logger.debug(f"Correlation plots not applicable: {e}")
 
 
 def _generate_forward_folding(
@@ -1266,8 +1953,6 @@ def _generate_forward_folding(
     nsteps = gen_cfg.get("nsteps", 200)  # More steps for forward folding
     batch_size = gen_cfg.get("batch_size", 1)
     n_trials = gen_cfg.get("n_trials", 1)  # Number of trials for best output selection
-
-    logger.info(f"Processing structures with {nsteps} generation steps, batch size {batch_size}, n_trials {n_trials}")
 
     # Initialize transforms
     structure_transform = StructureBackboneTransform(max_length=cfg.generation.get("max_length", 512))
@@ -1404,8 +2089,8 @@ def _generate_forward_folding(
                     input_sequence_tokens=padded_sequences,
                     input_mask=mask,
                     input_indices=indices,
+                    asynchronous_sampling=gen_cfg.get("asynchronous_sampling", False),
                 )
-
                 # Decode structures
                 decoded_x = model.decode_structure(generate_sample, mask)
 
@@ -1472,6 +2157,33 @@ def _generate_forward_folding(
             generate_sample = best_trial["generate_sample"]
             x_recon_xyz = best_trial["x_recon_xyz"]
             seq = best_trial["seq"]
+
+            # Write sequences to CSV
+            if csv_writer is not None:
+                # Convert generated sequences to strings
+                generated_sequence_strs = []
+                for i in range(B):
+                    seq_i = seq[i, mask[i] == 1]
+                    sequence_str = "".join([restype_order_with_x_inv[j.item()] for j in seq_i])
+                    generated_sequence_strs.append(sequence_str)
+
+                # Convert original sequences to strings (from input structures)
+                original_sequence_strs = []
+                for i, data in enumerate(filtered_batch_data):
+                    orig_seq = data["sequence"]
+                    if orig_seq.dim() > 1:
+                        orig_seq = orig_seq.squeeze()
+                    orig_seq_str = "".join([restype_order_with_x_inv[j.item()] for j in orig_seq])
+                    original_sequence_strs.append(orig_seq_str)
+
+                # Write to sequences CSV
+                csv_writer.write_sequences(
+                    sequences=generated_sequence_strs,
+                    original_sequences=original_sequence_strs,
+                    run_id=f"forward_folding_batch_{batch_idx:03d}",
+                    input_structure=[Path(batch_paths[i]).stem for i in filtered_valid_indices],
+                    trial_number=best_trial["trial"] + 1,
+                )
 
             # Save generated and original structures
             logger.info(f"Saving forward folding results for batch {batch_idx + 1}...")
@@ -1547,12 +2259,22 @@ def _generate_forward_folding(
     else:
         logger.warning("No TM-Score data collected")
 
+    # Calculate RMSD pass rate (< 2.0Å threshold)
+    rmsd_threshold = 2.0
+    rmsd_pass_rates = {}
+
     if all_rmsd_scores:
         # Filter out infinite RMSD values
         valid_rmsd = [r for r in all_rmsd_scores if r != float("inf")]
         if valid_rmsd:
             avg_rmsd = sum(valid_rmsd) / len(valid_rmsd)
             logger.info(f"Average RMSD: {avg_rmsd:.2f} Å (n={len(valid_rmsd)})")
+
+            pass_count = sum(1 for rmsd in valid_rmsd if rmsd < rmsd_threshold)
+            total_count = len(valid_rmsd)
+            pass_rate = (pass_count / total_count * 100) if total_count > 0 else 0.0
+            rmsd_pass_rates["rmsd"] = (pass_count, total_count, pass_rate)
+            logger.info(f"RMSD Pass Rate (< {rmsd_threshold:.1f}Å): {pass_count}/{total_count} ({pass_rate:.1f}%)")
         else:
             logger.warning("No valid RMSD data collected")
     else:
@@ -1568,10 +2290,14 @@ def _generate_forward_folding(
         metric_lists = {"tm_score": all_tm_scores, "rmsd": all_rmsd_scores}
 
         # Calculate aggregate statistics
-        aggregate_stats = _calculate_aggregate_stats(metric_lists)
+        aggregate_stats = calculate_aggregate_stats(metric_lists)
 
         # Write aggregate statistics to CSV
         csv_writer.write_aggregate_stats(aggregate_stats)
+
+        # Write pass rate statistics to CSV if available
+        if rmsd_pass_rates:
+            csv_writer.write_pass_rates(rmsd_pass_rates, threshold=rmsd_threshold)
 
     # Create plots from CSV data if plotter is available
     if plotter is not None and csv_writer is not None:
@@ -1580,99 +2306,13 @@ def _generate_forward_folding(
             plotter.create_box_plots_from_csv(csv_writer.csv_path)
             logger.info("✓ Box plots created successfully")
         except Exception as e:
-            logger.error(f"Error creating plots: {e}")
+            logger.error(f"Error creating box plots: {e}")
 
-
-def _align_and_compute_rmsd_inpainted(
-    gen_coords: torch.Tensor,
-    pred_coords: torch.Tensor,
-    inpainting_mask_seq: torch.Tensor | None,
-    inpainting_mask_struc: torch.Tensor | None,
-    device: torch.device,
-) -> tuple[torch.Tensor, float]:
-    """Align generated structure to ESMFold prediction using Kabsch algorithm on CA atoms,
-    considering only the union of inpainted positions. Then compute RMSD on those positions.
-
-    Args:
-        gen_coords: Generated structure coordinates, shape (N, 3, 3) - [N, CA, C] atoms
-        pred_coords: ESMFold prediction coordinates, shape (N, 3, 3) - [N, CA, C] atoms
-        inpainting_mask_seq: Sequence inpainting mask, shape (N,) or None
-        inpainting_mask_struc: Structure inpainting mask, shape (N,) or None
-        device: torch device
-
-    Returns:
-        gen_coords_aligned: Aligned generated structure, shape (N, 3, 3)
-        rmsd_inpainted: RMSD on inpainted region CA atoms after alignment (float)
-    """
-    N = gen_coords.shape[0]
-
-    # Step 1: Create union mask for all inpainted regions
-    if inpainting_mask_seq is None:
-        inpaint_mask_seq = torch.zeros(N, device=device)
-    else:
-        inpaint_mask_seq = inpainting_mask_seq
-
-    if inpainting_mask_struc is None:
-        inpaint_mask_struc = torch.zeros(N, device=device)
-    else:
-        inpaint_mask_struc = inpainting_mask_struc
-
-    # Union: any position that was inpainted in sequence OR structure
-    inpaint_mask_union = (inpaint_mask_seq.bool() | inpaint_mask_struc.bool()).float()
-
-    # Step 2: Check if there are any inpainted positions
-    num_inpainted = inpaint_mask_union.sum().item()
-    if num_inpainted == 0:
-        logger.warning("No inpainted positions found, skipping alignment")
-        return gen_coords, 0.0
-
-    # Step 3: Extract CA atoms (index 1)
-    gen_coords_ca = gen_coords[:, 1, :]  # Shape: (N, 3)
-    pred_coords_ca = pred_coords[:, 1, :]  # Shape: (N, 3)
-
-    # Step 4: Add batch dimension for kabsch_torch_batched
-    gen_coords_ca_batch = gen_coords_ca.unsqueeze(0)  # Shape: (1, N, 3)
-    pred_coords_ca_batch = pred_coords_ca.unsqueeze(0)  # Shape: (1, N, 3)
-    inpaint_mask_batch = inpaint_mask_union.unsqueeze(0)  # Shape: (1, N)
-
-    # Step 5: Apply Kabsch alignment - get rotation R and translation t
-    gen_coords_ca_aligned_batch, (R, t) = kabsch_torch_batched(
-        P=gen_coords_ca_batch,  # Source: generated structure CA atoms
-        Q=pred_coords_ca_batch,  # Target: ESMFold prediction CA atoms
-        mask=inpaint_mask_batch,  # Only use inpainted positions for alignment
-        return_transform=True,  # Need R and t to transform all atoms
-    )
-
-    gen_coords_ca_aligned = gen_coords_ca_aligned_batch.squeeze(0)  # Shape: (N, 3)
-
-    # Step 6: Calculate RMSD on inpainted region CA atoms after alignment
-    gen_inpainted_ca = gen_coords_ca_aligned[inpaint_mask_union.bool()]  # (M, 3)
-    pred_inpainted_ca = pred_coords_ca[inpaint_mask_union.bool()]  # (M, 3)
-
-    rmsd_inpainted = torch.sqrt(torch.mean((gen_inpainted_ca - pred_inpainted_ca) ** 2)).item()
-
-    # Step 7: Apply the same transformation (R, t) to ALL atoms (N, CA, C)
-    # This maintains the structural integrity of the backbone
-    R = R.squeeze(0)  # Shape: (3, 3)
-    t = t.squeeze(0)  # Shape: (3,)
-
-    # Get centroid of generated CA atoms (computed internally by Kabsch)
-    centroid_gen_ca = torch.sum(gen_coords_ca * inpaint_mask_union.unsqueeze(-1), dim=0) / inpaint_mask_union.sum()
-    centroid_pred_ca = torch.sum(pred_coords_ca * inpaint_mask_union.unsqueeze(-1), dim=0) / inpaint_mask_union.sum()
-
-    # Center all atoms around the CA centroid
-    gen_coords_centered = gen_coords - centroid_gen_ca.unsqueeze(0).unsqueeze(0)  # (N, 3, 3)
-
-    # Apply rotation to all atoms
-    gen_coords_rotated = torch.matmul(
-        gen_coords_centered.reshape(N * 3, 3),
-        R.transpose(0, 1),  # Flatten to (N*3, 3)  # Rotate
-    ).reshape(N, 3, 3)  # Reshape back to (N, 3, 3)
-
-    # Translate to target centroid
-    gen_coords_aligned = gen_coords_rotated + centroid_pred_ca.unsqueeze(0).unsqueeze(0)
-
-    return gen_coords_aligned, rmsd_inpainted
+        # Create correlation plots (only for unconditional mode)
+        try:
+            plotter.create_correlation_plots_from_csv(csv_writer.csv_path)
+        except Exception as e:
+            logger.debug(f"Correlation plots not applicable: {e}")
 
 
 def _generate_inpainting(
@@ -1725,6 +2365,7 @@ def _generate_inpainting(
     nsteps = gen_cfg.get("nsteps", 200)
     batch_size = gen_cfg.get("batch_size", 1)
     n_trials = gen_cfg.get("n_trials", 1)  # Number of trials for best output selection
+    n_designs_per_structure = gen_cfg.get("n_designs_per_structure", 1)  # Number of designs to generate per structure
 
     # Get inpainting masks from configuration
     mask_indices_seq = gen_cfg.get("mask_indices_sequence", "")
@@ -1734,6 +2375,7 @@ def _generate_inpainting(
     logger.info(f"Sequence mask indices: {mask_indices_seq if mask_indices_seq else '(no masking)'}")
     logger.info(f"Structure mask indices: {mask_indices_struc if mask_indices_struc else '(no masking)'}")
     logger.info(f"Processing structures with {nsteps} generation steps, batch size {batch_size}, n_trials {n_trials}")
+    logger.info(f"Generating {n_designs_per_structure} design(s) per structure")
 
     # Initialize transforms
     structure_transform = StructureBackboneTransform(max_length=cfg.generation.get("max_length", 512))
@@ -1864,334 +2506,641 @@ def _generate_inpainting(
                 padded_sequences[i, :seq_len] = seq[:seq_len]
 
             # Parse mask indices and create inpainting masks
-            # Note: We need to handle the mask per-sample if lengths differ
-            # For simplicity, we'll use the max_length and adjust per sample
-            inpainting_mask_seq = parse_mask_indices(mask_indices_seq, max_length, device)
-            inpainting_mask_struc = parse_mask_indices(mask_indices_struc, max_length, device)
+            # Handle three types: patterns (e.g., "GGGG"), random specs, or index specs
 
-            # Expand to batch size
-            inpainting_mask_seq = inpainting_mask_seq.expand(B, -1)
-            inpainting_mask_struc = inpainting_mask_struc.expand(B, -1)
-
-            num_masked_seq = inpainting_mask_seq[0].sum().item()
-            num_masked_struc = inpainting_mask_struc[0].sum().item()
-
-            if num_masked_seq > 0:
-                logger.info(f"Sequence inpainting mask: {num_masked_seq} positions to generate per sample")
-            if num_masked_struc > 0:
-                logger.info(f"Structure inpainting mask: {num_masked_struc} positions to generate per sample")
-
-            # Run multiple trials and select best based on TM-score
-            best_trial_results = []
-
-            for trial in range(n_trials):
-                logger.info(f"Trial {trial + 1}/{n_trials} for batch {batch_idx + 1}")
-
-                # Generate with inpainting
-                generate_sample = model.generate_sample(
-                    length=max_length,
-                    num_samples=B,
-                    nsteps=nsteps,
-                    temperature_seq=gen_cfg.get("temperature_seq", 0.5),
-                    temperature_struc=gen_cfg.get("temperature_struc", 1.0),
-                    stochasticity_seq=gen_cfg.get("stochasticity_seq", 20),
-                    stochasticity_struc=gen_cfg.get("stochasticity_struc", 20),
-                    inpainting=True,
-                    input_structure_coords=coords_res,
-                    input_sequence_tokens=padded_sequences,
-                    input_mask=mask,
-                    input_indices=indices,
-                    inpainting_mask_sequence=inpainting_mask_seq,
-                    inpainting_mask_structure=inpainting_mask_struc,
-                )
-
-                # Decode structures
-                decoded_x = model.decode_structure(generate_sample, mask)
-
-                # Extract coordinates
-                x_recon_xyz = None
-                for decoder_name in decoded_x:
-                    if "vit_decoder" == decoder_name:
-                        x_recon_xyz = decoded_x[decoder_name]
-                        break
-
-                if x_recon_xyz is None:
-                    raise RuntimeError("No structure decoder found in model output")
-
-                # Extract sequences
-                if generate_sample["sequence_logits"].shape[-1] == 33:
-                    seq = convert_lobster_aa_tokenization_to_standard_aa(
-                        generate_sample["sequence_logits"], device=device
-                    )
-                else:
-                    seq = generate_sample["sequence_logits"].argmax(dim=-1)
-                    seq[seq > 21] = 20
-
-                # Calculate TM-scores for this trial
-                trial_tm_scores = []
-                trial_rmsd_inpainted = []
-                for i in range(B):
-                    # Get original and generated coordinates
-                    orig_coords = coords_res[i, mask[i] == 1, :, :]  # Original structure
-                    gen_coords = x_recon_xyz[i, mask[i] == 1, :, :]  # Generated structure
-
-                    # Get sequence for TM-align
-                    seq_i = seq[i, mask[i] == 1]
-
-                    # Get chain information for this structure
-                    chains_i = filtered_batch_data[i]["chains"].to(device)[mask[i] == 1]
-
-                    # Build sequence string with chain breaks
-                    sequence_str = ""
-                    prev_chain = None
-                    for j, (aa_idx, chain_id) in enumerate(zip(seq_i, chains_i)):
-                        if prev_chain is not None and chain_id.item() != prev_chain:
-                            sequence_str += ":"
-                        sequence_str += restype_order_with_x_inv[aa_idx.item()]
-                        prev_chain = chain_id.item()
-
-                    sequence_str, position_ids, linker_mask = add_linker_to_sequence(sequence_str)
-                    # sequence_str = "".join([restype_order_with_x_inv[j.item()] for j in seq_i])
-
-                    if plm_fold is not None:
-                        # Tokenize the generated sequence
-                        tokenized_input = plm_fold.tokenizer.encode_plus(
-                            sequence_str,
-                            padding=True,
-                            truncation=True,
-                            max_length=cfg.generation.get("max_length", 512),
-                            add_special_tokens=False,
-                            return_tensors="pt",
-                        )["input_ids"].to(device)
-
-                        # Fold with ESMFold
-                        with torch.no_grad():
-                            # outputs = plm_fold.model(tokenized_input)
-                            outputs = plm_fold.model(tokenized_input, position_ids=position_ids.unsqueeze(0).to(device))
-                        # remove linker from outputs using linker_mask
-                        outputs["positions"] = outputs["positions"][:, :, linker_mask == 1, :, :]
-                        outputs["plddt"] = outputs["plddt"][:, linker_mask == 1]
-                        outputs["predicted_aligned_error"] = outputs["predicted_aligned_error"][:, linker_mask == 1]
-                        # use linker_mask to remove linker from sequence_str
-                        sequence_list = list(sequence_str)
-                        sequence_str = "".join(
-                            [seq_char for seq_char, mask_val in zip(sequence_list, linker_mask) if mask_val == 1]
-                        )
-
-                        # Get folded structure coordinates
-                        folded_structure_metrics, pred_coords = get_folded_structure_metrics(
-                            outputs, orig_coords[None], [sequence_str], mask=mask[i : i + 1]
-                        )
-
-                        # Align generated structure to ESMFold prediction and compute RMSD on inpainted region
-                        inpaint_mask_seq_i = (
-                            inpainting_mask_seq[i, mask[i] == 1] if inpainting_mask_seq is not None else None
-                        )
-                        inpaint_mask_struc_i = (
-                            inpainting_mask_struc[i, mask[i] == 1] if inpainting_mask_struc is not None else None
-                        )
-
-                        gen_coords_aligned, rmsd_inpainted = _align_and_compute_rmsd_inpainted(
-                            gen_coords=gen_coords,
-                            pred_coords=pred_coords[i],
-                            inpainting_mask_seq=inpaint_mask_seq_i,
-                            inpainting_mask_struc=inpaint_mask_struc_i,
-                            device=device,
-                        )
-
-                        # Update x_recon_xyz with aligned coordinates
-                        x_recon_xyz[i, mask[i] == 1] = gen_coords_aligned
-
-                        trial_tm_scores.append(folded_structure_metrics["_tm_score"])
-                        trial_rmsd_inpainted.append(rmsd_inpainted)
-                        trial_folded_structure_metrics = folded_structure_metrics  # Store for reuse
-                        logger.info(
-                            f"TM-score: {folded_structure_metrics['_tm_score']:.3f}, Inpainted RMSD: {rmsd_inpainted:.3f} Å"
-                        )
-
-                    else:
-                        # Calculate TM-Score using TM-align
-                        tm_out = tm_align(
-                            gen_coords[:, 1, :].cpu().numpy(),  # CA atoms of generated structure
-                            orig_coords[:, 1, :].detach().cpu().numpy(),  # CA atoms of original structure
-                            sequence_str,
-                            sequence_str,
-                        )
-                        trial_tm_scores.append(tm_out.tm_norm_chain1)
-                        trial_rmsd_inpainted.append(0.0)  # No ESMFold, no inpainted RMSD
-                        logger.info(f"Sample {i}: TM-Score: {tm_out.tm_norm_chain1:.3f}, RMSD: {tm_out.rmsd:.2f} Å")
-
-                # Store trial results
-                best_trial_results.append(
-                    {
-                        "trial": trial,
-                        "tm_scores": trial_tm_scores,
-                        "rmsd_inpainted": trial_rmsd_inpainted,
-                        "avg_tm_score": sum(trial_tm_scores) / len(trial_tm_scores),
-                        "avg_rmsd_inpainted": sum(trial_rmsd_inpainted) / len(trial_rmsd_inpainted)
-                        if trial_rmsd_inpainted
-                        else 0.0,
-                        "generate_sample": generate_sample,
-                        "x_recon_xyz": x_recon_xyz,
-                        "seq": seq,
-                        "esmfold_outputs": outputs,
-                        "esmfold_pred_coords": pred_coords,
-                        "folded_structure_metrics": trial_folded_structure_metrics,
-                    }
-                )
-
-            # Select best trial based on average TM-score
-            best_trial = max(best_trial_results, key=lambda x: x["avg_tm_score"])
-            logger.info(
-                f"Selected trial {best_trial['trial'] + 1} with average TM-score: {best_trial['avg_tm_score']:.3f}"
+            # Check if sequence mask is a pattern
+            is_pattern_seq = _is_sequence_pattern(mask_indices_seq) if mask_indices_seq else False
+            is_random_seq = (
+                isinstance(mask_indices_seq, str)
+                and "|" in mask_indices_seq
+                and mask_indices_seq.strip().lower().startswith("random")
             )
 
-            # Use best trial results
-            generate_sample = best_trial["generate_sample"]
-            x_recon_xyz = best_trial["x_recon_xyz"]
-            seq = best_trial["seq"]
+            # Check if structure mask is a pattern
+            is_pattern_struc = _is_sequence_pattern(mask_indices_struc) if mask_indices_struc else False
+            is_random_struc = (
+                isinstance(mask_indices_struc, str)
+                and "|" in mask_indices_struc
+                and mask_indices_struc.strip().lower().startswith("random")
+            )
 
-            # Calculate percent identity for inpainting (compare generated sequence with original)
-            batch_percent_identities_masked = []
-            batch_percent_identities_unmasked = []
+            # Generate sequence mask
+            if is_pattern_seq:
+                logger.info(f"Using sequence pattern-based masking: '{mask_indices_seq}'")
+                # Use original_sequences (pre-tokenized, raw AA indices)
+                inpainting_mask_seq = _create_sequence_pattern_masks(
+                    pattern=mask_indices_seq,
+                    sequences=original_sequences,
+                    max_length=max_length,
+                    device=device,
+                )
+            elif is_random_seq:
+                inpainting_mask_seq = parse_mask_indices(mask_indices_seq, max_length, device)
+                inpainting_mask_seq = inpainting_mask_seq.expand(B, -1)
+            else:
+                inpainting_mask_seq = parse_mask_indices(mask_indices_seq, max_length, device)
+                inpainting_mask_seq = inpainting_mask_seq.expand(B, -1)
 
-            for i, orig_seq in enumerate(original_sequences):
-                gen_seq = seq[i]
-                actual_mask = mask[i] == 1
+            # Generate structure mask
+            if is_pattern_struc:
+                logger.info(f"Using structure pattern-based masking: '{mask_indices_struc}'")
+                # Use original_sequences (pre-tokenized, raw AA indices)
+                inpainting_mask_struc = _create_sequence_pattern_masks(
+                    pattern=mask_indices_struc,
+                    sequences=original_sequences,
+                    max_length=max_length,
+                    device=device,
+                )
+            elif is_random_struc:
+                inpainting_mask_struc = parse_mask_indices(mask_indices_struc, max_length, device)
+                inpainting_mask_struc = inpainting_mask_struc.expand(B, -1)
+            else:
+                inpainting_mask_struc = parse_mask_indices(mask_indices_struc, max_length, device)
+                inpainting_mask_struc = inpainting_mask_struc.expand(B, -1)
 
-                # Get the actual length
-                orig_len = actual_mask.sum().item()
-                orig_seq_masked = orig_seq[:orig_len].to(device)
-                gen_seq_masked = gen_seq[:orig_len].to(device)
+            # Calculate masked positions (may vary per sample for pattern-based masks)
+            num_masked_seq = inpainting_mask_seq.sum(dim=1).float().mean().item()
+            num_masked_struc = inpainting_mask_struc.sum(dim=1).float().mean().item()
 
-                # Calculate percent identity for masked positions
-                if inpainting_mask_seq is not None:
-                    mask_positions = inpainting_mask_seq[i, :orig_len].bool()
-                    if mask_positions.sum() > 0:
-                        percent_identity_masked = calculate_percent_identity(
-                            orig_seq_masked[mask_positions].unsqueeze(0), gen_seq_masked[mask_positions].unsqueeze(0)
+            if num_masked_seq > 0:
+                logger.info(
+                    f"Sequence inpainting mask: {num_masked_seq:.1f} positions to generate (average per sample)"
+                )
+            if num_masked_struc > 0:
+                logger.info(
+                    f"Structure inpainting mask: {num_masked_struc:.1f} positions to generate (average per sample)"
+                )
+
+            # Loop over designs - generate multiple independent designs per structure
+            for design_idx in range(n_designs_per_structure):
+                if n_designs_per_structure > 1:
+                    logger.info("=" * 60)
+                    logger.info(f"DESIGN {design_idx + 1}/{n_designs_per_structure} for batch {batch_idx + 1}")
+                    logger.info("=" * 60)
+
+                # Run multiple trials and select best based on TM-score
+                best_trial_results = []
+
+                for trial in range(n_trials):
+                    logger.info(
+                        f"Trial {trial + 1}/{n_trials} for batch {batch_idx + 1}, design {design_idx + 1}/{n_designs_per_structure}"
+                    )
+
+                    # Generate with inpainting
+                    generate_sample = model.generate_sample(
+                        length=max_length,
+                        num_samples=B,
+                        nsteps=nsteps,
+                        temperature_seq=gen_cfg.get("temperature_seq", 0.5),
+                        temperature_struc=gen_cfg.get("temperature_struc", 1.0),
+                        stochasticity_seq=gen_cfg.get("stochasticity_seq", 20),
+                        stochasticity_struc=gen_cfg.get("stochasticity_struc", 20),
+                        inpainting=True,
+                        input_structure_coords=coords_res,
+                        input_sequence_tokens=padded_sequences,
+                        input_mask=mask,
+                        input_indices=indices,
+                        inpainting_mask_sequence=inpainting_mask_seq,
+                        inpainting_mask_structure=inpainting_mask_struc,
+                        asynchronous_sampling=gen_cfg.get("asynchronous_sampling", False),
+                    )
+
+                    # Decode structures
+                    decoded_x = model.decode_structure(generate_sample, mask)
+
+                    # Extract coordinates
+                    x_recon_xyz = None
+                    for decoder_name in decoded_x:
+                        if "vit_decoder" == decoder_name:
+                            x_recon_xyz = decoded_x[decoder_name]
+                            break
+
+                    if x_recon_xyz is None:
+                        raise RuntimeError("No structure decoder found in model output")
+
+                    # Extract sequences
+                    if generate_sample["sequence_logits"].shape[-1] == 33:
+                        seq = convert_lobster_aa_tokenization_to_standard_aa(
+                            generate_sample["sequence_logits"], device=device
                         )
-                        batch_percent_identities_masked.append(percent_identity_masked.item())
+                    else:
+                        seq = generate_sample["sequence_logits"].argmax(dim=-1)
+                        seq[seq > 21] = 20
+
+                    # Calculate TM-scores for this trial
+                    trial_tm_scores = []
+                    trial_rmsd_inpainted = []
+                    outputs = None
+                    pred_coords = None
+                    trial_folded_structure_metrics = None
+
+                    for i in range(B):
+                        # Get original and generated coordinates
+                        orig_coords = coords_res[i, mask[i] == 1, :, :]  # Original structure
+                        gen_coords = x_recon_xyz[i, mask[i] == 1, :, :]  # Generated structure
+
+                        # Get sequence for TM-align
+                        seq_i = seq[i, mask[i] == 1]
+
+                        # Get chain information for this structure
+                        chains_i = filtered_batch_data[i]["chains"].to(device)[mask[i] == 1]
+
+                        if plm_fold is not None:
+                            # Prepare inpainting masks
+                            inpaint_mask_seq_i = (
+                                inpainting_mask_seq[i, mask[i] == 1] if inpainting_mask_seq is not None else None
+                            )
+                            inpaint_mask_struc_i = (
+                                inpainting_mask_struc[i, mask[i] == 1] if inpainting_mask_struc is not None else None
+                            )
+
+                            # Parse chain groups from config
+                            esmfold_chain_groups = cfg.generation.get("esmfold_chain_groups", None)
+
+                            # If not specified, use all chains (default behavior for backwards compatibility)
+                            if esmfold_chain_groups is None:
+                                unique_chains = chains_i.unique().tolist()
+                                esmfold_chain_groups = [unique_chains]
+
+                            # Log available chains for debugging
+                            available_chains = chains_i.unique().tolist()
+                            logger.info(f"Available chains in structure: {available_chains}")
+                            logger.info(
+                                f"Predicting {len(esmfold_chain_groups)} chain group(s): {esmfold_chain_groups}"
+                            )
+
+                            # Warn if using chain-specific groups (coordinates won't be updated)
+                            using_chain_subset = len(esmfold_chain_groups) > 1 or sorted(
+                                esmfold_chain_groups[0]
+                            ) != sorted(available_chains)
+                            if using_chain_subset:
+                                logger.warning(
+                                    "Chain-specific groups detected: Generated coordinates will NOT be updated "
+                                    "with ESMFold-aligned predictions (incompatible reference frames). "
+                                    "ESMFold metrics are for analysis only."
+                                )
+
+                            # Run ESMFold prediction for each chain group
+                            chain_group_results = []
+                            for group_idx, chain_group in enumerate(esmfold_chain_groups):
+                                logger.info(
+                                    f"ESMFold prediction for chain group {group_idx + 1}/{len(esmfold_chain_groups)}: "
+                                    f"{chain_group}"
+                                )
+
+                                # Validate chain group
+                                invalid_chains = [c for c in chain_group if c not in available_chains]
+                                if invalid_chains:
+                                    logger.warning(
+                                        f"Chain group {chain_group} contains invalid chain IDs: {invalid_chains}. "
+                                        f"Available chains: {available_chains}. Skipping this group."
+                                    )
+                                    continue
+
+                                if not chain_group:
+                                    logger.warning("Empty chain group specified, skipping")
+                                    continue
+
+                                # Use refactored ESMFold prediction function with alignment
+                                result = predict_structure_with_esmfold(
+                                    plm_fold=plm_fold,
+                                    seq_i=seq_i,
+                                    chains_i=chains_i,
+                                    orig_coords=orig_coords,
+                                    gen_coords=gen_coords,  # Include generated coords for alignment
+                                    mask_i=mask[i],
+                                    cfg=cfg,
+                                    device=device,
+                                    restype_order_inv=restype_order_with_x_inv,
+                                    inpainting_mask_seq_i=inpaint_mask_seq_i,
+                                    inpainting_mask_struc_i=inpaint_mask_struc_i,
+                                    chain_group=chain_group,  # Specify which chains to predict
+                                )
+
+                                chain_group_results.append(result)
+
+                                logger.info(
+                                    f"Chain group {chain_group}: TM-score: "
+                                    f"{result['folded_structure_metrics']['_tm_score']:.3f}, "
+                                    f"Inpainted RMSD: {result['rmsd_inpainted']:.3f} Å, "
+                                    f"Chains: {result['num_chains']}, Residues: {result['num_residues']}"
+                                )
+
+                            # Handle results: use first group as primary, store all
+                            if chain_group_results:
+                                # Use FIRST chain group as primary result (user controls priority by ordering)
+                                primary_result = chain_group_results[0]
+
+                                logger.info(
+                                    f"Using first chain group {primary_result['chain_group']} as primary result: "
+                                    f"RMSD {primary_result['rmsd_inpainted']:.3f} Å, "
+                                    f"TM-score {primary_result['folded_structure_metrics']['_tm_score']:.3f}"
+                                )
+
+                                # Log all other results for comparison
+                                if len(chain_group_results) > 1:
+                                    logger.info("Additional chain group results:")
+                                    for idx, result in enumerate(chain_group_results[1:], start=2):
+                                        logger.info(
+                                            f"  Chain group {idx}/{len(chain_group_results)} {result['chain_group']}: "
+                                            f"RMSD {result['rmsd_inpainted']:.3f} Å, "
+                                            f"TM-score {result['folded_structure_metrics']['_tm_score']:.3f}, "
+                                            f"Chains: {result['num_chains']}, Residues: {result['num_residues']}"
+                                        )
+
+                                # Note: When using chain groups, we do NOT update coordinates
+                                # because the aligned coords are in a different reference frame
+                                # (only the filtered chains). Updating would not make physical sense.
+                                # The generated coordinates remain unchanged, and the ESMFold prediction
+                                # is used only for metrics and analysis.
+
+                                # Use primary result for output
+                                trial_tm_scores.append(primary_result["folded_structure_metrics"]["_tm_score"])
+                                trial_rmsd_inpainted.append(primary_result["rmsd_inpainted"])
+                                outputs = primary_result["esmfold_outputs"]
+                                pred_coords = primary_result["pred_coords"]
+                                trial_folded_structure_metrics = primary_result["folded_structure_metrics"]
+
+                                # Store ALL results for later analysis
+                                if trial_folded_structure_metrics is not None:
+                                    trial_folded_structure_metrics["_all_chain_group_results"] = chain_group_results
+                                    trial_folded_structure_metrics["_primary_chain_group"] = primary_result[
+                                        "chain_group"
+                                    ]
+                            else:
+                                # Fallback: if all chain groups invalid, use all chains
+                                logger.warning("No valid chain groups found, falling back to all chains")
+                                result = predict_structure_with_esmfold(
+                                    plm_fold=plm_fold,
+                                    seq_i=seq_i,
+                                    chains_i=chains_i,
+                                    orig_coords=orig_coords,
+                                    gen_coords=gen_coords,
+                                    mask_i=mask[i],
+                                    cfg=cfg,
+                                    device=device,
+                                    restype_order_inv=restype_order_with_x_inv,
+                                    inpainting_mask_seq_i=inpaint_mask_seq_i,
+                                    inpainting_mask_struc_i=inpaint_mask_struc_i,
+                                )
+
+                                # Update coordinates with aligned version
+                                x_recon_xyz[i, mask[i] == 1] = result["gen_coords_aligned"]
+
+                                trial_tm_scores.append(result["folded_structure_metrics"]["_tm_score"])
+                                trial_rmsd_inpainted.append(result["rmsd_inpainted"])
+                                outputs = result["esmfold_outputs"]
+                                pred_coords = result["pred_coords"]
+                                trial_folded_structure_metrics = result["folded_structure_metrics"]
+
+                                logger.info(
+                                    f"TM-score: {result['folded_structure_metrics']['_tm_score']:.3f}, "
+                                    f"Inpainted RMSD: {result['rmsd_inpainted']:.3f} Å"
+                                )
+
+                        else:
+                            # Calculate TM-Score using TM-align
+                            # Build sequence string for TM-align
+                            sequence_str = build_multichain_sequence_string(seq_i, chains_i, restype_order_with_x_inv)
+
+                            tm_out = tm_align(
+                                gen_coords[:, 1, :].cpu().numpy(),  # CA atoms of generated structure
+                                orig_coords[:, 1, :].detach().cpu().numpy(),  # CA atoms of original structure
+                                sequence_str,
+                                sequence_str,
+                            )
+                            trial_tm_scores.append(tm_out.tm_norm_chain1)
+                            trial_rmsd_inpainted.append(0.0)  # No ESMFold, no inpainted RMSD
+                            logger.info(f"Sample {i}: TM-Score: {tm_out.tm_norm_chain1:.3f}, RMSD: {tm_out.rmsd:.2f} Å")
+
+                    # Store trial results
+                    best_trial_results.append(
+                        {
+                            "trial": trial,
+                            "tm_scores": trial_tm_scores,
+                            "rmsd_inpainted": trial_rmsd_inpainted,
+                            "avg_tm_score": sum(trial_tm_scores) / len(trial_tm_scores),
+                            "avg_rmsd_inpainted": sum(trial_rmsd_inpainted) / len(trial_rmsd_inpainted)
+                            if trial_rmsd_inpainted
+                            else 0.0,
+                            "generate_sample": generate_sample,
+                            "x_recon_xyz": x_recon_xyz,
+                            "seq": seq,
+                            "esmfold_outputs": outputs,
+                            "esmfold_pred_coords": pred_coords,
+                            "folded_structure_metrics": trial_folded_structure_metrics,
+                        }
+                    )
+
+                # Select best trial based on average RMSD inpainted
+                best_trial = min(best_trial_results, key=lambda x: x["avg_rmsd_inpainted"])
+                logger.info(
+                    f"Selected trial {best_trial['trial'] + 1} with average RMSD inpainted: {best_trial['avg_rmsd_inpainted']:.3f}"
+                )
+
+                # Use best trial results
+                generate_sample = best_trial["generate_sample"]
+                x_recon_xyz = best_trial["x_recon_xyz"]
+                seq = best_trial["seq"]
+
+                # Calculate percent identity for inpainting (compare generated sequence with original)
+                batch_percent_identities_masked = []
+                batch_percent_identities_unmasked = []
+
+                for i, orig_seq in enumerate(original_sequences):
+                    gen_seq = seq[i]
+                    actual_mask = mask[i] == 1
+
+                    # Get the actual length
+                    orig_len = actual_mask.sum().item()
+                    orig_seq_masked = orig_seq[:orig_len].to(device)
+                    gen_seq_masked = gen_seq[:orig_len].to(device)
+
+                    # Calculate percent identity for masked positions
+                    if inpainting_mask_seq is not None:
+                        mask_positions = inpainting_mask_seq[i, :orig_len].bool()
+                        if mask_positions.sum() > 0:
+                            percent_identity_masked = calculate_percent_identity(
+                                orig_seq_masked[mask_positions].unsqueeze(0),
+                                gen_seq_masked[mask_positions].unsqueeze(0),
+                            )
+                            batch_percent_identities_masked.append(percent_identity_masked.item())
+                        else:
+                            batch_percent_identities_masked.append(0.0)
                     else:
                         batch_percent_identities_masked.append(0.0)
-                else:
-                    batch_percent_identities_masked.append(0.0)
 
-                # Calculate percent identity for unmasked positions
-                if inpainting_mask_seq is not None:
-                    unmask_positions = ~inpainting_mask_seq[i, :orig_len].bool()
-                    if unmask_positions.sum() > 0:
+                    # Calculate percent identity for unmasked positions
+                    if inpainting_mask_seq is not None:
+                        unmask_positions = ~inpainting_mask_seq[i, :orig_len].bool()
+                        if unmask_positions.sum() > 0:
+                            percent_identity_unmasked = calculate_percent_identity(
+                                orig_seq_masked[unmask_positions].unsqueeze(0),
+                                gen_seq_masked[unmask_positions].unsqueeze(0),
+                            )
+                            batch_percent_identities_unmasked.append(percent_identity_unmasked.item())
+                        else:
+                            batch_percent_identities_unmasked.append(100.0)
+                    else:
+                        # If no sequence mask, all positions are unmasked
                         percent_identity_unmasked = calculate_percent_identity(
-                            orig_seq_masked[unmask_positions].unsqueeze(0),
-                            gen_seq_masked[unmask_positions].unsqueeze(0),
+                            orig_seq_masked.unsqueeze(0), gen_seq_masked.unsqueeze(0)
                         )
                         batch_percent_identities_unmasked.append(percent_identity_unmasked.item())
+
+                # Write sequences to CSV
+                if csv_writer is not None:
+                    # Convert full generated sequences to strings
+                    generated_sequence_strs = []
+                    for i in range(B):
+                        seq_i = seq[i, mask[i] == 1]
+                        sequence_str = "".join([restype_order_with_x_inv[j.item()] for j in seq_i])
+                        generated_sequence_strs.append(sequence_str)
+
+                    # Convert full original sequences to strings
+                    original_sequence_strs = []
+                    for orig_seq in original_sequences:
+                        orig_seq_str = "".join([restype_order_with_x_inv[j.item()] for j in orig_seq])
+                        original_sequence_strs.append(orig_seq_str)
+
+                    # Extract ONLY the inpainted region sequences (generated and original)
+                    inpainted_region_strs = []
+                    original_inpainted_region_strs = []
+                    masked_positions_per_seq = []
+
+                    for i in range(B):
+                        if inpainting_mask_seq is not None and inpainting_mask_seq[i].sum() > 0:
+                            # Get the masked positions for this sequence
+                            seq_i = seq[i, mask[i] == 1]  # Generated sequence
+                            seq_len = (mask[i] == 1).sum().item()  # Actual sequence length
+                            orig_seq_i = original_sequences[i][:seq_len]  # Original sequence
+                            mask_bool = inpainting_mask_seq[i, mask[i] == 1].bool()
+
+                            # Find contiguous regions of masked positions
+                            masked_indices = mask_bool.nonzero(as_tuple=True)[0].cpu().tolist()
+
+                            if not masked_indices:
+                                inpainted_region_strs.append("")
+                                original_inpainted_region_strs.append("")
+                                masked_positions_per_seq.append([])
+                                continue
+
+                            # Store all masked positions for this sequence
+                            masked_positions_per_seq.append(masked_indices)
+
+                            # Split into contiguous regions
+                            regions = []
+                            current_region = [masked_indices[0]]
+
+                            for idx in masked_indices[1:]:
+                                if idx == current_region[-1] + 1:
+                                    # Contiguous - add to current region
+                                    current_region.append(idx)
+                                else:
+                                    # Non-contiguous - start new region
+                                    regions.append(current_region)
+                                    current_region = [idx]
+                            regions.append(current_region)  # Add the last region
+
+                            # Extract generated and original sequences for each region
+                            generated_region_sequences = []
+                            original_region_sequences = []
+                            for region_indices in regions:
+                                # Generated (inpainted) residues
+                                region_residues = seq_i[region_indices]
+                                region_seq = "".join([restype_order_with_x_inv[j.item()] for j in region_residues])
+                                generated_region_sequences.append(region_seq)
+
+                                # Original residues (before inpainting)
+                                original_region_residues = orig_seq_i[region_indices]
+                                original_region_seq = "".join(
+                                    [restype_order_with_x_inv[j.item()] for j in original_region_residues]
+                                )
+                                original_region_sequences.append(original_region_seq)
+
+                            # Join multiple regions with comma separator
+                            inpainted_region_str = ",".join(generated_region_sequences)
+                            original_inpainted_region_str = ",".join(original_region_sequences)
+                            inpainted_region_strs.append(inpainted_region_str)
+                            original_inpainted_region_strs.append(original_inpainted_region_str)
+                        else:
+                            # No sequence masking, empty strings
+                            inpainted_region_strs.append("")
+                            original_inpainted_region_strs.append("")
+                            masked_positions_per_seq.append([])
+
+                    # Determine run_id based on whether we are generating multiple designs
+                    if n_designs_per_structure > 1:
+                        run_id = f"inpainting_batch_{batch_idx:03d}_design_{design_idx:02d}"
                     else:
-                        batch_percent_identities_unmasked.append(100.0)
-                else:
-                    # If no sequence mask, all positions are unmasked
-                    percent_identity_unmasked = calculate_percent_identity(
-                        orig_seq_masked.unsqueeze(0), gen_seq_masked.unsqueeze(0)
-                    )
-                    batch_percent_identities_unmasked.append(percent_identity_unmasked.item())
-
-            # Save results
-            logger.info(f"Saving inpainting results for batch {batch_idx + 1}...")
-            for i, valid_idx in enumerate(filtered_valid_indices):
-                original_path = batch_paths[valid_idx]
-                original_name = Path(original_path).stem
-                x_recon_xyz_i_masked = x_recon_xyz[i, mask[i] == 1]
-                seq_i_masked = seq[i, mask[i] == 1]
-
-                # Save generated structure
-                filename = output_dir / f"inpainting_{original_name}_generated.pdb"
-                writepdb(str(filename), x_recon_xyz_i_masked, seq_i_masked)
-                logger.info(f"Saved: {filename}")
-
-            # Optional ESMFold validation - reuse results from trial selection
-            if plm_fold is not None:
-                logger.info(f"Validating batch {batch_idx + 1} with ESMFold...")
-
-                # Reuse ESMFold results from the best trial
-                if best_trial["folded_structure_metrics"] is not None and best_trial["esmfold_pred_coords"] is not None:
-                    # Use stored metrics without recalculation
-                    folded_structure_metrics = best_trial["folded_structure_metrics"]
-                    pred_coords = best_trial["esmfold_pred_coords"]
-
-                    # Log metrics
-                    logger.info("ESMFold validation metrics:")
-                    for key, value in folded_structure_metrics.items():
-                        logger.info(f"  {key}: {value:.4f}")
-
-                    # Save folded structures
-                    for i in range(seq.shape[0]):
-                        original_name = Path(batch_paths[filtered_valid_indices[i]]).stem
-                        filename = output_dir / f"inpainting_{original_name}_esmfold.pdb"
-                        pred_coords_i_masked = pred_coords[i, mask[i] == 1]
-                        seq_i_masked = seq[i, mask[i] == 1]
-                        writepdb(str(filename), pred_coords_i_masked, seq_i_masked)
-                        logger.info(f"Saved ESMFold structure: {filename}")
-
-                    batch_metrics = folded_structure_metrics
-                else:
-                    # Fallback to full ESMFold validation
-                    batch_metrics = _validate_with_esmfold(
-                        seq,
-                        x_recon_xyz,
-                        plm_fold,
-                        device,
-                        output_dir,
-                        f"inpainting_batch{batch_idx:03d}",
-                        original_paths=[batch_paths[i] for i in filtered_valid_indices],
-                        mask=mask,
-                        max_length=max_length,
-                    )
-
-                # Collect metrics for aggregate statistics
-                if batch_metrics:
-                    all_plddt_scores.append(batch_metrics["_plddt"])
-                    all_predicted_aligned_errors.append(batch_metrics["_predicted_aligned_error"])
-                    all_tm_scores.append(batch_metrics["_tm_score"])
-                    all_rmsd_scores.append(batch_metrics["_rmsd"])
-
-                    all_percent_identities_masked.extend(batch_percent_identities_masked)
-                    all_percent_identities_unmasked.extend(batch_percent_identities_unmasked)
-
-                    # Collect RMSD from inpainted region (from best trial)
-                    if "rmsd_inpainted" in best_trial and best_trial["rmsd_inpainted"]:
-                        all_rmsd_inpainted.extend(best_trial["rmsd_inpainted"])
-
-                    # Write batch metrics to CSV
-                    if csv_writer is not None:
                         run_id = f"inpainting_batch_{batch_idx:03d}"
-                        avg_percent_identity_masked = sum(batch_percent_identities_masked) / len(
-                            batch_percent_identities_masked
-                        )
-                        avg_percent_identity_unmasked = sum(batch_percent_identities_unmasked) / len(
-                            batch_percent_identities_unmasked
+
+                    # Write to sequences CSV
+                    csv_writer.write_sequences(
+                        sequences=generated_sequence_strs,
+                        original_sequences=original_sequence_strs,
+                        inpainted_sequences=inpainted_region_strs,
+                        original_inpainted_sequences=original_inpainted_region_strs,
+                        run_id=run_id,
+                        input_structure=[Path(batch_paths[i]).stem for i in filtered_valid_indices],
+                        trial_number=best_trial["trial"] + 1,
+                        percent_identities=batch_percent_identities_masked,
+                        masked_positions=masked_positions_per_seq,
+                    )
+
+                # Save results
+                logger.info(f"Saving inpainting results for batch {batch_idx + 1}, design {design_idx + 1}...")
+                for i, valid_idx in enumerate(filtered_valid_indices):
+                    original_path = batch_paths[valid_idx]
+                    original_name = Path(original_path).stem
+                    x_recon_xyz_i_masked = x_recon_xyz[i, mask[i] == 1]
+                    seq_i_masked = seq[i, mask[i] == 1]
+
+                    # Save generated structure with design index
+                    if n_designs_per_structure > 1:
+                        filename = output_dir / f"inpainting_{original_name}_design_{design_idx:02d}_generated.pdb"
+                    else:
+                        filename = output_dir / f"inpainting_{original_name}_generated.pdb"
+                    writepdb(str(filename), x_recon_xyz_i_masked, seq_i_masked)
+                    logger.info(f"Saved: {filename}")
+
+                # Optional ESMFold validation - reuse results from trial selection
+                if plm_fold is not None:
+                    logger.info(f"Validating batch {batch_idx + 1} with ESMFold...")
+
+                    # Reuse ESMFold results from the best trial
+                    if (
+                        best_trial["folded_structure_metrics"] is not None
+                        and best_trial["esmfold_pred_coords"] is not None
+                    ):
+                        # Use stored metrics without recalculation
+                        folded_structure_metrics = best_trial["folded_structure_metrics"]
+                        pred_coords = best_trial["esmfold_pred_coords"]
+
+                        # Log metrics
+                        logger.info("ESMFold validation metrics:")
+                        for key, value in folded_structure_metrics.items():
+                            # Skip internal fields that store chain group results
+                            if key.startswith("_all_") or key.startswith("_primary_"):
+                                continue
+                            # Format numeric values
+                            if isinstance(value, (int, float)):
+                                logger.info(f"  {key}: {value:.4f}")
+                            else:
+                                logger.info(f"  {key}: {value}")
+
+                        # Save folded structures
+                        for i in range(seq.shape[0]):
+                            original_name = Path(batch_paths[filtered_valid_indices[i]]).stem
+
+                            # Check if using chain groups (pred_coords is filtered)
+                            if "_primary_chain_group" in folded_structure_metrics:
+                                # pred_coords only contains the filtered chains
+                                # No need to mask - already filtered
+                                pred_coords_i = pred_coords[i]
+
+                                # Get the filtered sequence (from filtered chains)
+                                chains_i = filtered_batch_data[i]["chains"].to(device)[mask[i] == 1]
+                                seq_i_full = seq[i, mask[i] == 1]
+
+                                # Create mask for primary chain group
+                                primary_chain_group = folded_structure_metrics["_primary_chain_group"]
+                                chain_mask = torch.zeros_like(chains_i, dtype=torch.bool)
+                                for chain_id in primary_chain_group:
+                                    chain_mask |= chains_i == chain_id
+
+                                seq_i_filtered = seq_i_full[chain_mask]
+
+                                if n_designs_per_structure > 1:
+                                    filename = (
+                                        output_dir
+                                        / f"inpainting_{original_name}_design_{design_idx:02d}_esmfold_chains_{'_'.join(map(str, primary_chain_group))}.pdb"
+                                    )
+                                else:
+                                    filename = (
+                                        output_dir
+                                        / f"inpainting_{original_name}_esmfold_chains_{'_'.join(map(str, primary_chain_group))}.pdb"
+                                    )
+                                writepdb(str(filename), pred_coords_i, seq_i_filtered)
+                                logger.info(f"Saved ESMFold structure (chains {primary_chain_group}): {filename}")
+                            else:
+                                # Using all chains - normal masking
+                                pred_coords_i_masked = pred_coords[i, mask[i] == 1]
+                                seq_i_masked = seq[i, mask[i] == 1]
+                                if n_designs_per_structure > 1:
+                                    filename = (
+                                        output_dir / f"inpainting_{original_name}_design_{design_idx:02d}_esmfold.pdb"
+                                    )
+                                else:
+                                    filename = output_dir / f"inpainting_{original_name}_esmfold.pdb"
+                                writepdb(str(filename), pred_coords_i_masked, seq_i_masked)
+                                logger.info(f"Saved ESMFold structure: {filename}")
+
+                        batch_metrics = folded_structure_metrics
+                    else:
+                        # Fallback to full ESMFold validation
+                        batch_metrics = _validate_with_esmfold(
+                            seq,
+                            x_recon_xyz,
+                            plm_fold,
+                            device,
+                            output_dir,
+                            f"inpainting_batch{batch_idx:03d}",
+                            original_paths=[batch_paths[i] for i in filtered_valid_indices],
+                            mask=mask,
+                            max_length=max_length,
                         )
 
-                        num_masked_seq = inpainting_mask_seq[0].sum().item() if inpainting_mask_seq is not None else 0
-                        num_masked_struc = (
-                            inpainting_mask_struc[0].sum().item() if inpainting_mask_struc is not None else 0
-                        )
+                    # Collect metrics for aggregate statistics
+                    if batch_metrics:
+                        all_plddt_scores.append(batch_metrics["_plddt"])
+                        all_predicted_aligned_errors.append(batch_metrics["_predicted_aligned_error"])
+                        all_tm_scores.append(batch_metrics["_tm_score"])
+                        all_rmsd_scores.append(batch_metrics["_rmsd"])
 
-                        # Calculate average RMSD for inpainted region
-                        avg_rmsd_inpainted = (
-                            best_trial["avg_rmsd_inpainted"] if "avg_rmsd_inpainted" in best_trial else 0.0
-                        )
+                        all_percent_identities_masked.extend(batch_percent_identities_masked)
+                        all_percent_identities_unmasked.extend(batch_percent_identities_unmasked)
 
-                        csv_writer.write_batch_metrics(
-                            batch_metrics,
-                            run_id,
-                            percent_identity_masked=avg_percent_identity_masked,
-                            percent_identity_unmasked=avg_percent_identity_unmasked,
-                            rmsd_inpainted=avg_rmsd_inpainted,
-                            sequence_length=max_length,
-                            num_masked_seq=num_masked_seq,
-                            num_masked_struc=num_masked_struc,
-                            input_file=f"batch_{batch_idx:03d}",
-                        )
+                        # Collect RMSD from inpainted region (from best trial)
+                        if "rmsd_inpainted" in best_trial and best_trial["rmsd_inpainted"]:
+                            all_rmsd_inpainted.extend(best_trial["rmsd_inpainted"])
+
+                        # Write batch metrics to CSV
+                        if csv_writer is not None:
+                            if n_designs_per_structure > 1:
+                                run_id = f"inpainting_batch_{batch_idx:03d}_design_{design_idx:02d}"
+                            else:
+                                run_id = f"inpainting_batch_{batch_idx:03d}"
+                            avg_percent_identity_masked = sum(batch_percent_identities_masked) / len(
+                                batch_percent_identities_masked
+                            )
+                            avg_percent_identity_unmasked = sum(batch_percent_identities_unmasked) / len(
+                                batch_percent_identities_unmasked
+                            )
+
+                            num_masked_seq = (
+                                inpainting_mask_seq[0].sum().item() if inpainting_mask_seq is not None else 0
+                            )
+                            num_masked_struc = (
+                                inpainting_mask_struc[0].sum().item() if inpainting_mask_struc is not None else 0
+                            )
+
+                            # Calculate average RMSD for inpainted region
+                            avg_rmsd_inpainted = (
+                                best_trial["avg_rmsd_inpainted"] if "avg_rmsd_inpainted" in best_trial else 0.0
+                            )
+
+                            csv_writer.write_batch_metrics(
+                                batch_metrics,
+                                run_id,
+                                percent_identity_masked=avg_percent_identity_masked,
+                                percent_identity_unmasked=avg_percent_identity_unmasked,
+                                rmsd_inpainted=avg_rmsd_inpainted,
+                                sequence_length=max_length,
+                                num_masked_seq=num_masked_seq,
+                                num_masked_struc=num_masked_struc,
+                                input_file=f"batch_{batch_idx:03d}",
+                            )
 
     # Calculate and report aggregate statistics
     logger.info("=" * 80)
@@ -2234,15 +3183,33 @@ def _generate_inpainting(
     else:
         logger.warning("No TM-Score data collected")
 
+    # Calculate RMSD pass rates (< 2.0Å threshold)
+    rmsd_threshold = 2.0
+    rmsd_pass_rates = {}
+
     if all_rmsd_scores:
         avg_rmsd = sum(all_rmsd_scores) / len(all_rmsd_scores)
         logger.info(f"Average RMSD: {avg_rmsd:.2f} Å (n={len(all_rmsd_scores)})")
+
+        pass_count = sum(1 for rmsd in all_rmsd_scores if rmsd < rmsd_threshold)
+        total_count = len(all_rmsd_scores)
+        pass_rate = (pass_count / total_count * 100) if total_count > 0 else 0.0
+        rmsd_pass_rates["rmsd"] = (pass_count, total_count, pass_rate)
+        logger.info(f"RMSD Pass Rate (< {rmsd_threshold:.1f}Å): {pass_count}/{total_count} ({pass_rate:.1f}%)")
     else:
         logger.warning("No RMSD data collected")
 
     if all_rmsd_inpainted:
         avg_rmsd_inpainted = sum(all_rmsd_inpainted) / len(all_rmsd_inpainted)
         logger.info(f"Average RMSD (Inpainted Region): {avg_rmsd_inpainted:.3f} Å (n={len(all_rmsd_inpainted)})")
+
+        pass_count_inpainted = sum(1 for rmsd in all_rmsd_inpainted if rmsd < rmsd_threshold)
+        total_count_inpainted = len(all_rmsd_inpainted)
+        pass_rate_inpainted = (pass_count_inpainted / total_count_inpainted * 100) if total_count_inpainted > 0 else 0.0
+        rmsd_pass_rates["rmsd_inpainted"] = (pass_count_inpainted, total_count_inpainted, pass_rate_inpainted)
+        logger.info(
+            f"RMSD Pass Rate Inpainted (< {rmsd_threshold:.1f}Å): {pass_count_inpainted}/{total_count_inpainted} ({pass_rate_inpainted:.1f}%)"
+        )
     else:
         logger.warning("No inpainted region RMSD data collected")
 
@@ -2264,10 +3231,14 @@ def _generate_inpainting(
         }
 
         # Calculate aggregate statistics
-        aggregate_stats = _calculate_aggregate_stats(metric_lists)
+        aggregate_stats = calculate_aggregate_stats(metric_lists)
 
         # Write aggregate statistics to CSV
         csv_writer.write_aggregate_stats(aggregate_stats)
+
+        # Write pass rate statistics to CSV if available
+        if rmsd_pass_rates:
+            csv_writer.write_pass_rates(rmsd_pass_rates, threshold=rmsd_threshold)
 
     # Create plots from CSV data if plotter is available
     if plotter is not None and csv_writer is not None:
@@ -2276,7 +3247,13 @@ def _generate_inpainting(
             plotter.create_box_plots_from_csv(csv_writer.csv_path)
             logger.info("✓ Box plots created successfully")
         except Exception as e:
-            logger.error(f"Error creating plots: {e}")
+            logger.error(f"Error creating box plots: {e}")
+
+        # Create correlation plots (only for unconditional mode)
+        try:
+            plotter.create_correlation_plots_from_csv(csv_writer.csv_path)
+        except Exception as e:
+            logger.debug(f"Correlation plots not applicable: {e}")
 
 
 def _generate_binders(model, cfg: DictConfig, device: torch.device, output_dir: Path, plm_fold=None) -> None:
@@ -2321,12 +3298,21 @@ def _validate_with_esmfold(
         outputs = plm_fold.model(tokenized_input)
 
     # Get folding metrics
-    folded_structure_metrics, pred_coords = get_folded_structure_metrics(outputs, x_recon_xyz, sequence_str, mask=mask)
+    folded_structure_metrics, pred_coords = get_folded_structure_metrics(
+        outputs, x_recon_xyz, sequence_str, mask=mask, device=device
+    )
 
     # Log metrics
     logger.info("ESMFold validation metrics:")
     for key, value in folded_structure_metrics.items():
-        logger.info(f"  {key}: {value:.4f}")
+        # Skip internal fields that store chain group results
+        if key.startswith("_all_") or key.startswith("_primary_"):
+            continue
+        # Format numeric values
+        if isinstance(value, (int, float)):
+            logger.info(f"  {key}: {value:.4f}")
+        else:
+            logger.info(f"  {key}: {value}")
 
     # Save folded structures
     for i in range(len(sequence_str)):
