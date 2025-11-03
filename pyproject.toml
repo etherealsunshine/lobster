@@ -34,7 +34,7 @@ dependencies = [
     "onnxscript",
     "onnxruntime",
     "einops",
-    "beignet[datasets]>=0.0.13",
+    "beignet[datasets]",
     "dotenv>=0.9.9",
     "litdata>=0.2.49",
     "seaborn>=0.13.2",
@@ -86,6 +86,8 @@ struct-cpu = [
     "lightning-utilities",
     "mini3di",
     "cpdb-protein",
+    "bionemo-moco",
+    "tmtools",
     "colabdesign",
     "flax"
 ]
@@ -110,6 +112,8 @@ struct-gpu = [
     "lightning-utilities",
     "mini3di",
     "cpdb-protein",
+    "bionemo-moco",
+    "tmtools",
     "colabdesign",
     "jax[cuda]",
     "flax"
