@@ -95,10 +95,10 @@ We evaluated the fold prediction accuracy using embeddings from different Latent
 On
 ```bash
 # With latent generator CPU support
-uv sync --extra lg-cpu
+uv sync --extra struct-cpu
 
 # With latent generator GPU support  
-uv sync --extra lg-gpu
+uv sync --extra struct-gpu
 ```
 
 ## Getting Embeddings and Tokens

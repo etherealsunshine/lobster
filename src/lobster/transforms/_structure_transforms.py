@@ -37,8 +37,8 @@ class ESMEmbeddingTransform(BaseTransform):
         """
         import lobster
 
-        lobster.ensure_package("torch_geometric", group="lg-gpu (or --extra lg-cpu)")
-        lobster.ensure_package("esm", group="lg-gpu (or --extra lg-cpu)")
+        lobster.ensure_package("torch_geometric", group="struct-gpu (or --extra struct-cpu)")
+        lobster.ensure_package("esm", group="struct-gpu (or --extra struct-cpu)")
 
         super().__init__(**kwargs)
 
@@ -455,7 +455,7 @@ class StructureBackboneTransform(BaseTransform):
     def __init__(self, max_length=512, **kwargs):
         import lobster
 
-        lobster.ensure_package("torch_geometric", group="lg-gpu (or --extra lg-cpu)")
+        lobster.ensure_package("torch_geometric", group="struct-gpu (or --extra struct-cpu)")
 
         logger.info("StructureBackboneTransform")
         self.max_length = max_length
@@ -533,7 +533,7 @@ class StructureTemplateTransform(BaseTransform):
     def __init__(self, template_percentage: float = 0.5, mask_percentage: float = 0.3, **kwargs):
         import lobster
 
-        lobster.ensure_package("torch_geometric", group="lg-gpu (or --extra lg-cpu)")
+        lobster.ensure_package("torch_geometric", group="struct-gpu (or --extra struct-cpu)")
 
         super().__init__(**kwargs)
         self.template_percentage = template_percentage
@@ -581,7 +581,7 @@ class StructureLigandTransform(BaseTransform):
     def __init__(self, max_length=512, rand_permute_ligand=False, **kwargs):
         import lobster
 
-        lobster.ensure_package("torch_geometric", group="lg-gpu (or --extra lg-cpu)")
+        lobster.ensure_package("torch_geometric", group="struct-gpu (or --extra struct-cpu)")
 
         logger.info("StructureLigandTransform")
         self.max_length = max_length
@@ -617,7 +617,7 @@ class Structure3diTransform(BaseTransform):
         super().__init__(**kwargs)
         import lobster
 
-        lobster.ensure_package("torch_geometric", group="lg-gpu (or --extra lg-cpu)")
+        lobster.ensure_package("torch_geometric", group="struct-gpu (or --extra struct-cpu)")
 
         self.encoder = Encoder()
 
@@ -640,7 +640,7 @@ class StructureC6DTransform(BaseTransform):
         super().__init__(**kwargs)
         import lobster
 
-        lobster.ensure_package("torch_geometric", group="lg-gpu (or --extra lg-cpu)")
+        lobster.ensure_package("torch_geometric", group="struct-gpu (or --extra struct-cpu)")
 
         self.dist_cutoff = dist_cutoff
 
@@ -694,7 +694,7 @@ class BinderTargetTransform(BaseTransform):
         super().__init__(**kwargs)
         import lobster
 
-        lobster.ensure_package("torch_geometric", group="lg-gpu (or --extra lg-cpu)")
+        lobster.ensure_package("torch_geometric", group="struct-gpu (or --extra struct-cpu)")
 
         # logger.info("BinderTargetTransform")
         self.translation_scale = translation_scale
@@ -807,7 +807,7 @@ class StructureResidueTransform(BaseTransform):
     def __init__(self, atom14=True, crop=None):
         import lobster
 
-        lobster.ensure_package("torch_geometric", group="lg-gpu (or --extra lg-cpu)")
+        lobster.ensure_package("torch_geometric", group="struct-gpu (or --extra struct-cpu)")
 
         self.atom14 = atom14
         self.crop = crop
@@ -914,7 +914,7 @@ class RandomChainTransform(BaseTransform):
     def __init__(self, **kwargs):
         import lobster
 
-        lobster.ensure_package("torch_geometric", group="lg-gpu (or --extra lg-cpu)")
+        lobster.ensure_package("torch_geometric", group="struct-gpu (or --extra struct-cpu)")
 
         """Initialize the RandomChainTransform.
 

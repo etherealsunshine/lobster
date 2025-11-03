@@ -135,7 +135,8 @@ class StructureDataset(Dataset):
     ):
         import lobster
 
-        lobster.ensure_package("torch_geometric", group="lg-gpu (or --extra lg-cpu)")
+        lobster.ensure_package("torch_geometric", group="struct-gpu (or --extra struct-cpu)")
+        lobster.ensure_package("icecream", group="struct-gpu (or --extra struct-cpu)")
 
         self.root = pathlib.Path(root)
         self.processed_dir = self.root

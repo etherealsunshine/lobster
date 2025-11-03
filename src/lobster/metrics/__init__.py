@@ -17,9 +17,12 @@ from ._generation_utils import (
     build_multichain_sequence_string,
     predict_structure_with_esmfold,
 )
+from ._alphafold2_scores import alphafold2_complex_scores, alphafold2_binder_scores
 
 __all__ = [
     "summarize_binary_classification_metrics",
     "RandomNeighborScore",
     "PerturbationScore",
+    "alphafold2_complex_scores",
+    "alphafold2_binder_scores",
 ]
