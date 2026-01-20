@@ -16,6 +16,8 @@ from lobster.model import LobsterPLMFold
 
 logger = logging.getLogger(__name__)
 
+logger = logging.getLogger(__name__)
+
 
 class InverseFoldingCallback(lightning.Callback):
     def __init__(

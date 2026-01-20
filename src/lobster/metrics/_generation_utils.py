@@ -10,6 +10,7 @@ from lobster.model.latent_generator.utils import kabsch_torch_batched
 from lobster.model.latent_generator.utils.residue_constants import restype_order_with_x
 
 
+# Set up logging
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 

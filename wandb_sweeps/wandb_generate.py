@@ -12,6 +12,7 @@ Usage:
     sbatch wandb_slurm.sh
 """
 
+import logging
 from pathlib import Path
 import logging
 

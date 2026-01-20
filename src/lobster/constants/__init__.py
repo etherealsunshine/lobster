@@ -48,6 +48,7 @@ from ._alphafold2 import (
     DEFAULT_AF2_PREDICTION_MODELS,
     DEFAULT_AF2_WEIGHTS_DIR,
 )
+from ._tabpfn import MAX_FEATURES_PER_MODEL, MAX_SAMPLES_PER_MODEL
 
 __all__ = [
     "AMINO_ACID_GROUPS",
@@ -97,4 +98,6 @@ __all__ = [
     "SklearnProbeType",
     "DEFAULT_AF2_PREDICTION_MODELS",
     "DEFAULT_AF2_WEIGHTS_DIR",
+    "MAX_FEATURES_PER_MODEL",
+    "MAX_SAMPLES_PER_MODEL",
 ]

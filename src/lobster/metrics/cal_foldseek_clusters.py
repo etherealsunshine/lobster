@@ -1,10 +1,10 @@
 import subprocess
 import os
+import logging
 from pathlib import Path
 from biotite.sequence.io import fasta
 import shutil
 import pandas as pd
-import logging
 
 logger = logging.getLogger(__name__)
 

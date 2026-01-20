@@ -32,6 +32,7 @@ logger = logging.getLogger(__name__)
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
 @hydra.main(version_base=None, config_path="../hydra_config", config_name="generate")

@@ -1,9 +1,9 @@
 import lightning
+import logging
 import os
 import torch
 from lobster.model.latent_generator.io import writepdb
 from lobster.model.latent_generator.utils.residue_constants import convert_lobster_aa_tokenization_to_standard_aa
-import logging
 
 logger = logging.getLogger(__name__)
 
